@@ -618,21 +618,18 @@ pub struct GetResult {
 /// traffic — potentially hundreds in long-lived deployments — so
 /// consolidating them removes hundreds of file-create fsyncs at init
 /// time and lets a single redb write tx span many daily indices.
-fn is_shared_family(name: &str) -> bool {
-    // Arkime indices are typically prefixed (e.g. `tests_sessions3-*`,
-    // `arkime_sessions3-*`). Match any collection whose name contains
-    // the substring `sessions` so all per-day session indices collapse
-    // into the one shared file regardless of Arkime's configured prefix.
-    name.contains("sessions")
-}
-
 fn db_path_for(root: &Path, name: &str) -> (PathBuf, bool) {
-    if is_shared_family(name) {
-        (root.join("collections").join("sessions.redb"), true)
-    } else {
-        let safe = name.replace('/', "_").replace('\\', "_");
-        (root.join("collections").join(format!("{safe}.redb")), false)
-    }
+    // All collections live in one of two shared redb files. See module
+    // comment above `open_collection` for rationale.
+    //   * `sessions.redb` — any name containing "sessions" (large per-
+    //     month capture indices; isolated so session writers don't
+    //     contend with small-index writers).
+    //   * `other.redb`   — everything else (users, views, stats,
+    //     fields_v3, configs_v2, cont3xt_*, tagger, …). Tiny, often
+    //     single-doc indices; collapsing them removes N fsyncs per
+    //     bulk batch and tens of files.
+    let file = if name.contains("sessions") { "sessions.redb" } else { "other.redb" };
+    (root.join("collections").join(file), true)
 }
 
 fn open_collection(
