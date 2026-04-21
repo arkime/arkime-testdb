@@ -1557,8 +1557,19 @@ async fn do_bulk(s: &Arc<AppState>, default_idx: Option<String>, q: BulkQ, body:
             if seen_idx.insert(c.to_string()) { ensure_with_templates(s, c); }
         }
     }
-    let results = match s.engine.bulk_write(default_idx.as_deref(), ops) {
-        Ok(r) => r, Err(e) => return internal(e),
+    // Run the sync, potentially-long bulk_write on the blocking thread
+    // pool. Previously this ran on the tokio worker directly; once all
+    // sessions indices share one redb writer mutex, concurrent capture
+    // bulks serialize and would block every tokio worker, starving even
+    // trivial endpoints like /_cluster/health.
+    let engine = s.engine.clone();
+    let default_idx_clone = default_idx.clone();
+    let results = match tokio::task::spawn_blocking(move || {
+        engine.bulk_write(default_idx_clone.as_deref(), ops)
+    }).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(arkimedb_core::Error::Io(std::io::Error::other(e.to_string()))),
     };
     let errors = results.iter().any(|r| r.error.is_some());
     let items: Vec<J> = results.into_iter().map(outcome_to_item).collect();

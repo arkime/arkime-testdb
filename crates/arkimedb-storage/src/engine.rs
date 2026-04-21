@@ -23,6 +23,38 @@ const VERSIONS: TableDefinition<u32, u64>     = TableDefinition::new("versions")
 const META: TableDefinition<&str, u64>        = TableDefinition::new("meta");        // scalar counters
 const TOMBSTONES: TableDefinition<u32, u8>    = TableDefinition::new("tombstones");  // row_id -> 1 if deleted
 
+/// Per-collection set of redb table handles. For collections in a shared
+/// DB these names are prefixed with the collection name (e.g.
+/// `docs__sessions3-250420`); for solo-db collections they are the plain
+/// default names above.
+#[derive(Clone, Copy)]
+pub struct CollTables {
+    pub docs: TableDefinition<'static, u32, &'static [u8]>,
+    pub id2row: TableDefinition<'static, &'static str, u32>,
+    pub row2id: TableDefinition<'static, u32, &'static str>,
+    pub versions: TableDefinition<'static, u32, u64>,
+    pub meta: TableDefinition<'static, &'static str, u64>,
+    pub tombstones: TableDefinition<'static, u32, u8>,
+}
+
+impl CollTables {
+    fn default_names() -> Self {
+        Self { docs: DOCS, id2row: ID2ROW, row2id: ROW2ID, versions: VERSIONS, meta: META, tombstones: TOMBSTONES }
+    }
+    fn prefixed(name: &str) -> Self {
+        let safe: String = name.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        Self {
+            docs:       TableDefinition::new(leak(format!("docs__{safe}"))),
+            id2row:     TableDefinition::new(leak(format!("id2row__{safe}"))),
+            row2id:     TableDefinition::new(leak(format!("row2id__{safe}"))),
+            versions:   TableDefinition::new(leak(format!("versions__{safe}"))),
+            meta:       TableDefinition::new(leak(format!("meta__{safe}"))),
+            tombstones: TableDefinition::new(leak(format!("tombstones__{safe}"))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DocHit {
     pub row_id: u32,
@@ -38,12 +70,17 @@ pub struct Collection {
     /// Tombstoned row ids (not yet GC'd). Also stored in `TOMBSTONES`.
     pub tombstones: RwLock<RoaringBitmap>,
     pub(crate) storage_cfg: StorageConfig,
+    /// True if this collection's Database is shared with other
+    /// collections (sessions-family). Writes to shared-DB collections
+    /// serialize on the same redb writer mutex.
+    pub(crate) shared_db: bool,
+    pub(crate) tables: CollTables,
 }
 
 impl Collection {
     pub fn row_count(&self) -> Result<u64> {
         let r = self.db.begin_read()?;
-        let t = r.open_table(META)?;
+        let t = r.open_table(self.tables.meta)?;
         Ok(t.get("doc_count")?.map(|v| v.value()).unwrap_or(0))
     }
 
@@ -51,7 +88,7 @@ impl Collection {
     /// `all_live_rows` to avoid scanning the full DOCS B-tree.
     pub fn next_row_id_value(&self) -> Result<u32> {
         let r = self.db.begin_read()?;
-        let t = r.open_table(META)?;
+        let t = r.open_table(self.tables.meta)?;
         Ok(t.get("next_row_id")?.map(|v| v.value()).unwrap_or(0) as u32)
     }
 
@@ -62,8 +99,8 @@ impl Collection {
         -> Result<Vec<(Option<String>, Option<Vec<u8>>)>>
     {
         let r = self.db.begin_read()?;
-        let row2id = if want_id  { Some(r.open_table(ROW2ID)?) } else { None };
-        let docs   = if want_raw { Some(r.open_table(DOCS)?)   } else { None };
+        let row2id = if want_id  { Some(r.open_table(self.tables.row2id)?) } else { None };
+        let docs   = if want_raw { Some(r.open_table(self.tables.docs)?)   } else { None };
         let mut out = Vec::with_capacity(rows.len());
         for &row_id in rows {
             let id = if let Some(t) = &row2id {
@@ -81,7 +118,7 @@ impl Collection {
     }
 
     pub fn next_row_id(&self, w: &redb::WriteTransaction) -> Result<u32> {
-        let mut t = w.open_table(META)?;
+        let mut t = w.open_table(self.tables.meta)?;
         let cur = t.get("next_row_id")?.map(|v| v.value()).unwrap_or(0);
         let next = cur + 1;
         t.insert("next_row_id", next)?;
@@ -90,11 +127,11 @@ impl Collection {
 
     pub fn get_by_id(&self, id: &str) -> Result<Option<(u32, u64, Vec<u8>)>> {
         let r = self.db.begin_read()?;
-        let id2row = r.open_table(ID2ROW)?;
+        let id2row = r.open_table(self.tables.id2row)?;
         let Some(row_id) = id2row.get(id)?.map(|v| v.value()) else { return Ok(None); };
         if self.tombstones.read().contains(row_id) { return Ok(None); }
-        let docs = r.open_table(DOCS)?;
-        let ver_t = r.open_table(VERSIONS)?;
+        let docs = r.open_table(self.tables.docs)?;
+        let ver_t = r.open_table(self.tables.versions)?;
         let Some(raw) = docs.get(row_id)?.map(|v| v.value().to_vec()) else { return Ok(None); };
         let version = ver_t.get(row_id)?.map(|v| v.value()).unwrap_or(1);
         let json_bytes = codec::decompress(&raw)?;
@@ -104,7 +141,7 @@ impl Collection {
     /// Returns true if present.
     pub fn has_id(&self, id: &str) -> Result<bool> {
         let r = self.db.begin_read()?;
-        let id2row = r.open_table(ID2ROW)?;
+        let id2row = r.open_table(self.tables.id2row)?;
         match id2row.get(id)? {
             Some(v) => Ok(!self.tombstones.read().contains(v.value())),
             None => Ok(false),
@@ -113,7 +150,7 @@ impl Collection {
 
     pub fn get_raw_by_row(&self, row_id: u32) -> Result<Option<Vec<u8>>> {
         let r = self.db.begin_read()?;
-        let docs = r.open_table(DOCS)?;
+        let docs = r.open_table(self.tables.docs)?;
         match docs.get(row_id)? {
             Some(v) => Ok(Some(codec::decompress(v.value())?)),
             None => Ok(None),
@@ -122,7 +159,7 @@ impl Collection {
 
     pub fn doc_id_of(&self, row_id: u32) -> Result<Option<String>> {
         let r = self.db.begin_read()?;
-        let t = r.open_table(ROW2ID)?;
+        let t = r.open_table(self.tables.row2id)?;
         Ok(t.get(row_id)?.map(|v| v.value().to_string()))
     }
 
@@ -141,8 +178,8 @@ impl Collection {
     fn hydrate_index(&self) -> Result<()> {
         // Rebuild in-memory posting lists and field catalog from persisted docs.
         let r = self.db.begin_read()?;
-        let docs = r.open_table(DOCS)?;
-        let tomb = r.open_table(TOMBSTONES)?;
+        let docs = r.open_table(self.tables.docs)?;
+        let tomb = r.open_table(self.tables.tombstones)?;
         let mut tomb_bm = RoaringBitmap::new();
         for row in tomb.iter()? {
             let (k, _) = row?;
@@ -295,6 +332,13 @@ pub struct Engine {
     pub field_catalog: Arc<FieldCatalog>,
     pub config: Config,
     collections: RwLock<AHashMap<String, Arc<Collection>>>,
+    /// Map of shared-db path -> open Database. Any collection whose name
+    /// matches a sharing family (currently: `sessions*`) routes to one of
+    /// these shared Databases and uses prefixed table names internally.
+    /// This collapses hundreds of daily-index files into a single redb
+    /// file, slashing startup file-open count and cross-collection commit
+    /// overhead.
+    shared_dbs: RwLock<AHashMap<PathBuf, Arc<Database>>>,
 }
 
 impl Engine {
@@ -320,13 +364,14 @@ impl Engine {
         }).collect();
 
         use rayon::prelude::*;
+        let shared_dbs: RwLock<AHashMap<PathBuf, Arc<Database>>> = RwLock::new(AHashMap::new());
         let loaded: Vec<Result<(String, Arc<Collection>)>> = valid
             .par_iter()
             .map(|name| -> Result<(String, Arc<Collection>)> {
                 let schema = catalog.get_schema(name)?.unwrap_or_default();
                 field_catalog.replace(name, schema.clone());
                 let col = Arc::new(open_collection(
-                    &config.data_dir, name, schema, config.storage.clone()
+                    &config.data_dir, name, schema, config.storage.clone(), &shared_dbs,
                 )?);
                 col.hydrate_index()?;
                 Ok((name.clone(), col))
@@ -346,6 +391,7 @@ impl Engine {
             field_catalog,
             config,
             collections: RwLock::new(collections),
+            shared_dbs,
         }))
     }
 
@@ -382,7 +428,7 @@ impl Engine {
         self.catalog.register_collection(&effective, &schema)?;
         self.field_catalog.replace(&effective, schema.clone());
         let col = Arc::new(open_collection(
-            &self.data_dir, &effective, schema, self.config.storage.clone()
+            &self.data_dir, &effective, schema, self.config.storage.clone(), &self.shared_dbs,
         )?);
         col.hydrate_index()?;
         g.insert(effective, col.clone());
@@ -420,20 +466,17 @@ impl Engine {
     }
 
     pub fn bulk_write(&self, default_collection: Option<&str>, ops: Vec<BulkOp>) -> Result<Vec<BulkOutcome>> {
-        // Group ops by collection while remembering each op's original index
-        // so we can re-emit results in input order. ES `_bulk` response items
-        // are ordered positionally — clients index into them by position.
+        // Group by collection (preserving per-collection op order) then group
+        // collections by their underlying redb Database. Collections in a
+        // shared DB (sessions family) commit together in ONE write tx per DB
+        // — huge reduction in commit count for capture bulks that span many
+        // daily indices. Non-shared-DB collections each get their own tx
+        // (one per collection). We then run the per-DB work in parallel with
+        // rayon, since distinct redb Databases have distinct writer mutexes.
         //
-        // Prior version only batched *contiguous* same-collection ops; but
-        // Arkime capture bulks frequently interleave 100+ daily sessions3-*
-        // collections, yielding one begin_write/commit per op (~35ms each
-        // for new-file creation). Grouping non-contiguous is safe as long
-        // as within-collection order is preserved (ES last-write-wins for
-        // same id holds trivially).
-        //
-        // Each collection is its own redb file, so commits across
-        // collections are independent — run them in parallel. This is a
-        // large win for bulks that create/touch many collections at once.
+        // IMPORTANT: we deliberately do NOT parallelize across collections
+        // inside a shared DB — redb serializes writers, so doing so would
+        // just block rayon threads on the same mutex and starve the pool.
         use rayon::prelude::*;
         let n = ops.len();
         let mut by_coll: ahash::AHashMap<String, Vec<(usize, BulkOp)>> = Default::default();
@@ -456,63 +499,26 @@ impl Engine {
             coll_groups.push((col, group, name));
         }
 
-        // Parallel per-collection commits. Each closure returns
-        // Vec<(orig_idx, BulkOutcome)>.
+        // Partition by underlying DB identity (Arc::as_ptr).
+        let mut by_db: ahash::AHashMap<usize, Vec<(Arc<Collection>, Vec<(usize, BulkOp)>, String)>> = Default::default();
+        for entry in coll_groups {
+            let key = Arc::as_ptr(&entry.0.db) as usize;
+            by_db.entry(key).or_default().push(entry);
+        }
+        let db_groups: Vec<Vec<(Arc<Collection>, Vec<(usize, BulkOp)>, String)>> = by_db.into_values().collect();
+
         let fc = self.field_catalog.clone();
-        let per_coll: Vec<Vec<(usize, BulkOutcome)>> = coll_groups
+        let per_db: Vec<Vec<(usize, BulkOutcome)>> = db_groups
             .into_par_iter()
-            .map(|(col, group, cname)| {
-                let mut out: Vec<(usize, BulkOutcome)> = Vec::with_capacity(group.len());
-                // Split the group into runs of Index/Create vs single Delete/Update.
-                // Batching runs of Index/Create uses one tx per run; Delete/Update
-                // use the single-op helpers (still one tx each, but on same col).
-                let mut i = 0;
-                while i < group.len() {
-                    let is_batchable = |op: &BulkOp| matches!(op.kind, BulkKind::Index{..} | BulkKind::Create{..});
-                    if is_batchable(&group[i].1) {
-                        let mut j = i;
-                        while j < group.len() && is_batchable(&group[j].1) { j += 1; }
-                        let refs: Vec<&BulkOp> = (i..j).map(|k| &group[k].1).collect();
-                        match write_many_in_one_tx(&col, &fc, &refs) {
-                            Ok(batch) => {
-                                for (k, r) in batch.into_iter().enumerate() {
-                                    let orig = group[i + k].0;
-                                    out.push((orig, match r {
-                                        Ok(br) => BulkOutcome::ok(&cname, br),
-                                        Err(e) => BulkOutcome::err(&cname, e),
-                                    }));
-                                }
-                            }
-                            Err(e) => {
-                                // tx-level failure: surface for every op in the batch
-                                for k in i..j {
-                                    let orig = group[k].0;
-                                    out.push((orig, BulkOutcome::err(&cname, Error::Io(std::io::Error::other(e.to_string())))));
-                                }
-                            }
-                        }
-                        i = j;
-                    } else {
-                        let (orig, op) = &group[i];
-                        let res = match &op.kind {
-                            BulkKind::Delete { id } => delete_one(&col, id),
-                            BulkKind::Update { id, doc } => update_one(&col, &fc, id, doc.clone()),
-                            _ => unreachable!(),
-                        };
-                        out.push((*orig, match res {
-                            Ok(r) => BulkOutcome::ok(&cname, r),
-                            Err(e) => BulkOutcome::err(&cname, e),
-                        }));
-                        i += 1;
-                    }
-                }
-                out
+            .map(|cols| {
+                // Each `cols` entry = (col, ops, name) that share a Database.
+                bulk_write_one_db(&cols, &fc)
             })
             .collect();
 
         // Re-emit in original op order.
         let mut placed: Vec<Option<BulkOutcome>> = (0..n).map(|_| None).collect();
-        for chunk in per_coll {
+        for chunk in per_db {
             for (orig, bo) in chunk { placed[orig] = Some(bo); }
         }
         Ok(placed.into_iter().map(|o| o.expect("bulk outcome slot")).collect())
@@ -537,10 +543,24 @@ impl Engine {
 
     pub fn delete_collection(&self, name: &str) -> Result<bool> {
         let mut g = self.collections.write();
-        if g.remove(name).is_none() { return Ok(false); }
-        // remove file
-        let p = collection_path(&self.data_dir, name);
-        let _ = std::fs::remove_file(&p);
+        let col = match g.remove(name) { Some(c) => c, None => return Ok(false) };
+        if col.shared_db {
+            // Shared DB: don't delete the file — just drop this collection's tables.
+            let mut w = col.db.begin_write()?;
+            w.set_durability(redb::Durability::Eventual);
+            let _ = w.delete_table(col.tables.docs);
+            let _ = w.delete_table(col.tables.id2row);
+            let _ = w.delete_table(col.tables.row2id);
+            let _ = w.delete_table(col.tables.versions);
+            let _ = w.delete_table(col.tables.meta);
+            let _ = w.delete_table(col.tables.tombstones);
+            w.commit()?;
+        } else {
+            // Drop the Arc so redb releases the file handle before removing.
+            drop(col);
+            let (path, _) = db_path_for(&self.data_dir, name);
+            let _ = std::fs::remove_file(&path);
+        }
         Ok(true)
     }
 }
@@ -592,37 +612,88 @@ pub struct GetResult {
 
 // --- helpers --------------------------------------------------------------
 
-fn open_collection(root: &Path, name: &str, schema: CollectionSchema, storage_cfg: StorageConfig) -> Result<Collection> {
-    let path = collection_path(root, name);
+/// Collections whose name starts with `sessions` share a single redb file
+/// at `<data>/collections/sessions.redb` with prefixed per-collection
+/// tables. Arkime creates one such collection *per day* of captured
+/// traffic — potentially hundreds in long-lived deployments — so
+/// consolidating them removes hundreds of file-create fsyncs at init
+/// time and lets a single redb write tx span many daily indices.
+fn is_shared_family(name: &str) -> bool {
+    // Arkime indices are typically prefixed (e.g. `tests_sessions3-*`,
+    // `arkime_sessions3-*`). Match any collection whose name contains
+    // the substring `sessions` so all per-day session indices collapse
+    // into the one shared file regardless of Arkime's configured prefix.
+    name.contains("sessions")
+}
+
+fn db_path_for(root: &Path, name: &str) -> (PathBuf, bool) {
+    if is_shared_family(name) {
+        (root.join("collections").join("sessions.redb"), true)
+    } else {
+        let safe = name.replace('/', "_").replace('\\', "_");
+        (root.join("collections").join(format!("{safe}.redb")), false)
+    }
+}
+
+fn open_collection(
+    root: &Path,
+    name: &str,
+    schema: CollectionSchema,
+    storage_cfg: StorageConfig,
+    shared_dbs: &RwLock<AHashMap<PathBuf, Arc<Database>>>,
+) -> Result<Collection> {
+    let (path, shared) = db_path_for(root, name);
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-    let db = Database::create(&path).map_err(Error::from)?;
-    // create tables
+
+    let db: Arc<Database> = if shared {
+        // IMPORTANT: bind the read result into a local so the read guard
+        // is dropped before we try to acquire the write lock below.
+        // `if let Some(d) = shared_dbs.read().get(..).cloned() { .. } else { shared_dbs.write() }`
+        // extends the read guard's lifetime into the else branch (Rust
+        // temporary-lifetime rule for `if let` scrutinees), deadlocking
+        // parking_lot RwLock against the same thread.
+        let cached = shared_dbs.read().get(&path).cloned();
+        if let Some(d) = cached {
+            d
+        } else {
+            let mut g = shared_dbs.write();
+            if let Some(d) = g.get(&path).cloned() {
+                d
+            } else {
+                let d = Arc::new(Database::create(&path).map_err(Error::from)?);
+                g.insert(path.clone(), d.clone());
+                d
+            }
+        }
+    } else {
+        Arc::new(Database::create(&path).map_err(Error::from)?)
+    };
+
+    let tables = if shared { CollTables::prefixed(name) } else { CollTables::default_names() };
+
+    // create this collection's tables inside the (possibly-shared) db
     let mut w = db.begin_write()?;
     w.set_durability(redb::Durability::Eventual);
     {
-        let _ = w.open_table(DOCS)?;
-        let _ = w.open_table(ID2ROW)?;
-        let _ = w.open_table(ROW2ID)?;
-        let _ = w.open_table(VERSIONS)?;
-        let _ = w.open_table(META)?;
-        let _ = w.open_table(TOMBSTONES)?;
+        let _ = w.open_table(tables.docs)?;
+        let _ = w.open_table(tables.id2row)?;
+        let _ = w.open_table(tables.row2id)?;
+        let _ = w.open_table(tables.versions)?;
+        let _ = w.open_table(tables.meta)?;
+        let _ = w.open_table(tables.tombstones)?;
     }
     w.commit()?;
     Ok(Collection {
         name: name.to_string(),
         path,
-        db: Arc::new(db),
+        db,
         index: Arc::new(PostingsIndex::new()),
         schema: RwLock::new(schema),
         tombstones: RwLock::new(RoaringBitmap::new()),
         storage_cfg,
+        shared_db: shared,
+        tables,
     })
-}
-
-fn collection_path(root: &Path, name: &str) -> PathBuf {
-    // sanitize: disallow path separators
-    let safe = name.replace('/', "_").replace('\\', "_");
-    root.join("collections").join(format!("{safe}.redb"))
 }
 
 // --- tx-scoped doc write helpers ------------------------------------------
@@ -631,11 +702,12 @@ fn collection_path(root: &Path, name: &str) -> PathBuf {
 /// In-memory index updates must be applied by the caller *after* `w.commit()`.
 fn write_doc_in_tx(
     w: &redb::WriteTransaction,
+    t: &CollTables,
     id: &str,
     compressed: &[u8],
     require_create: bool,
 ) -> Result<(u32, bool, u64)> {
-    let mut id2row = w.open_table(ID2ROW)?;
+    let mut id2row = w.open_table(t.id2row)?;
     let existing = id2row.get(id)?.map(|v| v.value());
     let (row_id, created) = match existing {
         Some(r) => {
@@ -643,47 +715,47 @@ fn write_doc_in_tx(
             (r, false)
         }
         None => {
-            let mut meta = w.open_table(META)?;
+            let mut meta = w.open_table(t.meta)?;
             let cur = meta.get("next_row_id")?.map(|v| v.value()).unwrap_or(0);
             meta.insert("next_row_id", cur + 1)?;
             drop(meta);
             id2row.insert(id, cur as u32)?;
-            let mut row2id = w.open_table(ROW2ID)?;
+            let mut row2id = w.open_table(t.row2id)?;
             row2id.insert(cur as u32, id)?;
             (cur as u32, true)
         }
     };
     drop(id2row);
     {
-        let mut docs = w.open_table(DOCS)?;
+        let mut docs = w.open_table(t.docs)?;
         docs.insert(row_id, compressed)?;
     }
     let version = {
-        let mut vt = w.open_table(VERSIONS)?;
+        let mut vt = w.open_table(t.versions)?;
         let cur = vt.get(row_id)?.map(|v| v.value()).unwrap_or(0);
         let new = cur + 1;
         vt.insert(row_id, new)?;
         new
     };
     if created {
-        let mut meta = w.open_table(META)?;
+        let mut meta = w.open_table(t.meta)?;
         let cur = meta.get("doc_count")?.map(|v| v.value()).unwrap_or(0);
         meta.insert("doc_count", cur + 1)?;
     }
     Ok((row_id, created, version))
 }
 
-fn delete_doc_in_tx(w: &redb::WriteTransaction, id: &str) -> Result<Option<u32>> {
-    let id2row = w.open_table(ID2ROW)?;
+fn delete_doc_in_tx(w: &redb::WriteTransaction, t: &CollTables, id: &str) -> Result<Option<u32>> {
+    let id2row = w.open_table(t.id2row)?;
     let row_id = id2row.get(id)?.map(|v| v.value());
     drop(id2row);
     let Some(row_id) = row_id else { return Ok(None); };
     {
-        let mut tomb = w.open_table(TOMBSTONES)?;
+        let mut tomb = w.open_table(t.tombstones)?;
         tomb.insert(row_id, 1u8)?;
     }
     {
-        let mut meta = w.open_table(META)?;
+        let mut meta = w.open_table(t.meta)?;
         let cur = meta.get("doc_count")?.map(|v| v.value()).unwrap_or(0);
         if cur > 0 { meta.insert("doc_count", cur - 1)?; }
     }
@@ -708,7 +780,7 @@ fn write_one(col: &Arc<Collection>, fc: &Arc<FieldCatalog>, id: Option<String>, 
     let compressed = codec::compress(&bytes, col.storage_cfg.zstd_level)?;
     let mut w = col.db.begin_write()?;
     w.set_durability(redb::Durability::Eventual);
-    let (row_id, created, version) = write_doc_in_tx(&w, &id, &compressed, require_create)?;
+    let (row_id, created, version) = write_doc_in_tx(&w, &col.tables, &id, &compressed, require_create)?;
     w.commit()?;
     col.tombstones.write().remove(row_id);
     if !created {
@@ -781,7 +853,7 @@ fn write_many_in_one_tx(
             Err(_) => { /* carried through below */ }
             Ok(p) => {
                 let id = p.id.clone().unwrap_or_else(uuid_like);
-                match write_doc_in_tx(&w, &id, &p.compressed, p.require_create) {
+                match write_doc_in_tx(&w, &col.tables, &id, &p.compressed, p.require_create) {
                     Ok((row_id, created, version)) => {
                         in_tx_results.push(Ok((pi, id, row_id, created, version)));
                     }
@@ -831,7 +903,7 @@ fn write_many_in_one_tx(
 fn delete_one(col: &Arc<Collection>, id: &str) -> Result<BulkResult> {
     let mut w = col.db.begin_write()?;
     w.set_durability(redb::Durability::Eventual);
-    let row_id = match delete_doc_in_tx(&w, id)? {
+    let row_id = match delete_doc_in_tx(&w, &col.tables, id)? {
         Some(r) => r,
         None => { w.commit()?; return Err(Error::NotFound(format!("doc {id} not found"))); }
     };
@@ -852,6 +924,238 @@ fn update_one(col: &Arc<Collection>, fc: &Arc<FieldCatalog>, id: &str, doc: serd
         r.action = "update";
         r
     })
+}
+
+/// Execute the Index/Create/Delete/Update ops for all collections that
+/// share a single redb Database in **one** write transaction. Update/Delete
+/// of non-existent docs and Create conflicts produce per-item errors in
+/// the returned outcomes — the tx still commits.
+///
+/// This is the core win from consolidating sessions indices: instead of
+/// N commits (one per daily index touched by a bulk request) we do 1.
+fn bulk_write_one_db(
+    cols: &[(Arc<Collection>, Vec<(usize, BulkOp)>, String)],
+    fc: &Arc<FieldCatalog>,
+) -> Vec<(usize, BulkOutcome)> {
+    // Pick the shared db handle from the first collection (all share it).
+    let db = cols[0].0.db.clone();
+
+    // Prep: per-op compressed body + schema merge. Done outside the tx
+    // so we hold the writer lock for as little time as possible.
+    #[derive(Default)]
+    struct Prep {
+        id: Option<String>,
+        source: serde_json::Value,
+        compressed: Vec<u8>,
+        require_create: bool,
+        is_create: bool,
+        error: Option<Error>,
+    }
+    // Flat list of (orig_idx, coll_index, op_kind, prep).
+    // coll_index indexes into `cols`.
+    struct Item {
+        orig: usize,
+        col_i: usize,
+        kind: BulkKind,
+        prep: Option<Prep>,
+    }
+    let mut items: Vec<Item> = Vec::new();
+    for (ci, (col, group, _cname)) in cols.iter().enumerate() {
+        for (orig, op) in group {
+            let kind = match &op.kind {
+                BulkKind::Index { id, source } => BulkKind::Index { id: id.clone(), source: source.clone() },
+                BulkKind::Create { id, source } => BulkKind::Create { id: id.clone(), source: source.clone() },
+                BulkKind::Delete { id } => BulkKind::Delete { id: id.clone() },
+                BulkKind::Update { id, doc } => BulkKind::Update { id: id.clone(), doc: doc.clone() },
+            };
+            let prep = match &op.kind {
+                BulkKind::Index { id: idx_id, source } => {
+                    if !matches!(source, serde_json::Value::Object(_)) {
+                        Some(Prep { error: Some(Error::BadRequest("source must be a JSON object".into())), ..Default::default() })
+                    } else {
+                        let changed = fc.merge_from_record(&col.name, source);
+                        if changed {
+                            let mut s = col.schema.write();
+                            if let Some(cs) = fc.get(&col.name) { *s = cs; }
+                        }
+                        match serde_json::to_vec(source)
+                            .map_err(Error::from)
+                            .and_then(|b| codec::compress(&b, col.storage_cfg.zstd_level).map_err(Error::Io))
+                        {
+                            Ok(compressed) => Some(Prep {
+                                id: idx_id.clone(),
+                                source: source.clone(),
+                                compressed,
+                                require_create: false,
+                                is_create: false,
+                                error: None,
+                            }),
+                            Err(e) => Some(Prep { error: Some(e), ..Default::default() }),
+                        }
+                    }
+                }
+                BulkKind::Create { id: cre_id, source } => {
+                    if !matches!(source, serde_json::Value::Object(_)) {
+                        Some(Prep { error: Some(Error::BadRequest("source must be a JSON object".into())), ..Default::default() })
+                    } else {
+                        let changed = fc.merge_from_record(&col.name, source);
+                        if changed {
+                            let mut s = col.schema.write();
+                            if let Some(cs) = fc.get(&col.name) { *s = cs; }
+                        }
+                        match serde_json::to_vec(source)
+                            .map_err(Error::from)
+                            .and_then(|b| codec::compress(&b, col.storage_cfg.zstd_level).map_err(Error::Io))
+                        {
+                            Ok(compressed) => Some(Prep {
+                                id: Some(cre_id.clone()),
+                                source: source.clone(),
+                                compressed,
+                                require_create: true,
+                                is_create: true,
+                                error: None,
+                            }),
+                            Err(e) => Some(Prep { error: Some(e), ..Default::default() }),
+                        }
+                    }
+                }
+                _ => None,
+            };
+            items.push(Item { orig: *orig, col_i: ci, kind, prep });
+        }
+    }
+
+    // Single write tx for the whole DB.
+    let mut out: Vec<(usize, BulkOutcome)> = Vec::with_capacity(items.len());
+    let mut w = match db.begin_write() {
+        Ok(w) => w,
+        Err(e) => {
+            // Whole-tx failure: report error for every op.
+            for it in &items {
+                let cname = &cols[it.col_i].2;
+                out.push((it.orig, BulkOutcome::err(cname, Error::Io(std::io::Error::other(e.to_string())))));
+            }
+            return out;
+        }
+    };
+    w.set_durability(redb::Durability::Eventual);
+
+    // Per-op results inside the tx.
+    struct TxRes { row_id: u32, created: bool, version: u64, id: String }
+    let mut tx_results: Vec<std::result::Result<TxRes, Error>> = Vec::with_capacity(items.len());
+    for it in &items {
+        let col = &cols[it.col_i].0;
+        let t = &col.tables;
+        match &it.kind {
+            BulkKind::Index { .. } | BulkKind::Create { .. } => {
+                let prep = it.prep.as_ref().unwrap();
+                if let Some(e) = &prep.error {
+                    tx_results.push(Err(Error::BadRequest(e.to_string())));
+                    continue;
+                }
+                let id = prep.id.clone().unwrap_or_else(uuid_like);
+                match write_doc_in_tx(&w, t, &id, &prep.compressed, prep.require_create) {
+                    Ok((row_id, created, version)) => tx_results.push(Ok(TxRes { row_id, created, version, id })),
+                    Err(e) => tx_results.push(Err(e)),
+                }
+            }
+            BulkKind::Delete { id } => {
+                match delete_doc_in_tx(&w, t, id) {
+                    Ok(Some(row_id)) => tx_results.push(Ok(TxRes { row_id, created: false, version: 0, id: id.clone() })),
+                    Ok(None) => tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))),
+                    Err(e) => tx_results.push(Err(e)),
+                }
+            }
+            BulkKind::Update { id, doc } => {
+                // Read current source, merge patch, rewrite via write_doc_in_tx.
+                // Uses the in-flight write tx for reads so we see our own
+                // earlier writes in the same bulk.
+                let id2row = match w.open_table(t.id2row) { Ok(x) => x, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                let row_id_opt = match id2row.get(id.as_str()) { Ok(v) => v.map(|x| x.value()), Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                drop(id2row);
+                let Some(row_id) = row_id_opt else { tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))); continue; };
+                let docs = match w.open_table(t.docs) { Ok(x) => x, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                let cur_bytes = match docs.get(row_id) {
+                    Ok(Some(v)) => match codec::decompress(v.value()) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } },
+                    Ok(None) => { tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))); continue; }
+                    Err(e) => { tx_results.push(Err(Error::from(e))); continue; }
+                };
+                drop(docs);
+                let mut cur: serde_json::Value = match serde_json::from_slice(&cur_bytes) { Ok(v) => v, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                if let (serde_json::Value::Object(base), serde_json::Value::Object(patch)) = (&mut cur, doc.clone()) {
+                    for (k, v) in patch { base.insert(k, v); }
+                }
+                let col = &cols[it.col_i].0;
+                let changed = fc.merge_from_record(&col.name, &cur);
+                if changed {
+                    let mut s = col.schema.write();
+                    if let Some(cs) = fc.get(&col.name) { *s = cs; }
+                }
+                let bytes = match serde_json::to_vec(&cur) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                let compressed = match codec::compress(&bytes, col.storage_cfg.zstd_level) { Ok(c) => c, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } };
+                match write_doc_in_tx(&w, t, id, &compressed, false) {
+                    Ok((row_id, _created, version)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone() })),
+                    Err(e) => tx_results.push(Err(e)),
+                }
+            }
+        }
+    }
+
+    if let Err(e) = w.commit() {
+        // Commit failure taints every op.
+        for it in &items {
+            let cname = &cols[it.col_i].2;
+            out.push((it.orig, BulkOutcome::err(cname, Error::Io(std::io::Error::other(e.to_string())))));
+        }
+        return out;
+    }
+
+    // Post-commit: update in-memory state (tombstones, postings index).
+    for (it, r) in items.iter().zip(tx_results.into_iter()) {
+        let col = &cols[it.col_i].0;
+        let cname = &cols[it.col_i].2;
+        match r {
+            Err(e) => out.push((it.orig, BulkOutcome::err(cname, e))),
+            Ok(tr) => {
+                match &it.kind {
+                    BulkKind::Delete { .. } => {
+                        col.tombstones.write().insert(tr.row_id);
+                        out.push((it.orig, BulkOutcome::ok(cname, BulkResult { id: tr.id, version: tr.version, action: "delete", created: false })));
+                    }
+                    BulkKind::Index { .. } | BulkKind::Create { .. } => {
+                        col.tombstones.write().remove(tr.row_id);
+                        if !tr.created { col.index.remove_row(tr.row_id); }
+                        let src = &it.prep.as_ref().unwrap().source;
+                        {
+                            let mut schema = col.schema.write();
+                            index_one(&col.index, &mut schema, tr.row_id, src);
+                        }
+                        let is_create = matches!(it.kind, BulkKind::Create{..});
+                        out.push((it.orig, BulkOutcome::ok(cname, BulkResult {
+                            id: tr.id, version: tr.version,
+                            action: if is_create { "create" } else { "index" },
+                            created: tr.created,
+                        })));
+                    }
+                    BulkKind::Update { .. } => {
+                        col.tombstones.write().remove(tr.row_id);
+                        col.index.remove_row(tr.row_id);
+                        // Rebuild postings for the now-current doc: we
+                        // wrote `cur` (base + patch) above; re-read it
+                        // cheaply from the collection.
+                        if let Ok(Some((_, _, bytes))) = col.get_by_id(&tr.id) {
+                            if let Ok(src) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                let mut schema = col.schema.write();
+                                index_one(&col.index, &mut schema, tr.row_id, &src);
+                            }
+                        }
+                        out.push((it.orig, BulkOutcome::ok(cname, BulkResult { id: tr.id, version: tr.version, action: "update", created: false })));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn uuid_like() -> String { uuid_fast() }
