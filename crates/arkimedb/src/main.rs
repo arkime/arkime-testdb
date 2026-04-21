@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
                 start: std::time::Instant::now(),
                 scrolls: parking_lot::RwLock::new(ahash::AHashMap::new()),
                 cluster_settings: parking_lot::RwLock::new(Default::default()),
+                update_locks: parking_lot::Mutex::new(ahash::AHashMap::new()),
             });
             arkimedb_http::init_http_log_from_env();
             if debug { arkimedb_http::set_http_debug(true); }

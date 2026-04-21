@@ -24,6 +24,13 @@ pub struct AppState {
     pub start: std::time::Instant,
     pub scrolls: parking_lot::RwLock<ahash::AHashMap<String, ScrollState>>,
     pub cluster_settings: parking_lot::RwLock<ClusterSettings>,
+    /// Per-(collection,id) async mutex for serializing read-modify-write
+    /// script updates. Without this, two concurrent `addtags`/`removetags`
+    /// calls for the same document race and one update is lost (read both
+    /// see old tags, both write their own version, last writer wins).
+    /// Arkime's viewer fans out tag updates with `eachLimit(10)` and the
+    /// same session id can appear in the list multiple times.
+    pub update_locks: parking_lot::Mutex<ahash::AHashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Whether per-request access lines are written to stderr. Controlled via
@@ -861,12 +868,32 @@ async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J)
     // Find the collection containing the doc.
     let cols = match s.engine.resolve(idx) { Ok(v) => v, Err(e) => return internal(e) };
     let mut found: Option<(Arc<arkimedb_storage::Collection>, Vec<u8>)> = None;
+    let mut found_col_name: Option<String> = None;
     for c in cols {
-        if let Ok(Some((_rid, _ver, raw))) = c.get_by_id(id) { found = Some((c, raw)); break; }
+        if let Ok(Some((_rid, _ver, raw))) = c.get_by_id(id) {
+            found_col_name = Some(c.name.clone());
+            found = Some((c, raw));
+            break;
+        }
     }
-    let (col, raw) = match found {
+    let (col, _raw_first) = match found {
         Some(x) => x,
         None => return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}")),
+    };
+    // Acquire the per-doc update lock so concurrent script updates to the
+    // same doc serialize their read-modify-write cycles.
+    let lock_key = format!("{}/{}", found_col_name.as_deref().unwrap_or(""), id);
+    let lock = {
+        let mut map = s.update_locks.lock();
+        map.entry(lock_key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    };
+    let _guard = lock.lock().await;
+    // Re-read inside the lock — another concurrent update may have just
+    // committed a newer version.
+    let raw = match col.get_by_id(id) {
+        Ok(Some((_rid, _ver, raw))) => raw,
+        Ok(None) => return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}")),
+        Err(e) => return internal(e),
     };
     let mut cur: J = match serde_json::from_slice(&raw) { Ok(v) => v, Err(e) => return internal(Error::BadRequest(e.to_string())) };
     if let Err(e) = apply_script_mutation(&mut cur, &src_text, &params) {
