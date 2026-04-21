@@ -31,11 +31,19 @@ pub struct AppState {
 /// test suite generates tens of thousands of requests per run and writing
 /// an access line for each one added measurable wall time.
 static HTTP_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HTTP_DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn init_http_log_from_env() {
     if std::env::var("ARKIMEDB_HTTP_LOG").ok().as_deref() == Some("1") {
         HTTP_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    if std::env::var("ARKIMEDB_DEBUG").ok().as_deref() == Some("1") {
+        HTTP_DEBUG.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn set_http_debug(on: bool) {
+    HTTP_DEBUG.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[derive(Default)]
@@ -154,11 +162,46 @@ async fn log_requests(req: Request<axum::body::Body>, next: Next) -> Response {
         axum::http::HeaderValue::from_static("Elasticsearch"),
     );
     let dt = t0.elapsed();
-    // Per-request access log: enabled only via ARKIMEDB_HTTP_LOG=1.
-    // Formerly unconditional; the eprintln!+format+stderr flush per request
-    // cost measurable time under the Arkime test suite (tens of thousands
-    // of requests funneled through one file).
-    if HTTP_LOG.load(std::sync::atomic::Ordering::Relaxed) {
+    let log_plain = HTTP_LOG.load(std::sync::atomic::Ordering::Relaxed);
+    let log_debug = HTTP_DEBUG.load(std::sync::atomic::Ordering::Relaxed);
+    if log_debug {
+        // Buffer the full response body so we can report exact byte count.
+        // Slightly slower than streaming, but only on when --debug is set.
+        let status = resp.status().as_u16();
+        let (mut parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        let nbytes = bytes.len();
+        let ts = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        eprintln!(
+            "[debug] {} {} {} -> {} {}B ({:.2}ms)",
+            ts, method, uri, status, nbytes, dt.as_secs_f64() * 1000.0
+        );
+        if pretty {
+            let is_json = parts.headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map_or(false, |v| v.contains("json"));
+            if is_json {
+                let pretty_bytes: Vec<u8> = match serde_json::from_slice::<J>(&bytes) {
+                    Ok(v) => serde_json::to_vec_pretty(&v).unwrap_or_else(|_| bytes.to_vec()),
+                    Err(_) => bytes.to_vec(),
+                };
+                parts.headers.insert(
+                    axum::http::header::CONTENT_LENGTH,
+                    pretty_bytes.len().to_string().parse().unwrap(),
+                );
+                return Response::from_parts(parts, axum::body::Body::from(pretty_bytes));
+            }
+        }
+        parts.headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            nbytes.to_string().parse().unwrap(),
+        );
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    if log_plain {
         eprintln!(
             "[http] {} {} -> {} ({:.1}ms)",
             method,

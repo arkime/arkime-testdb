@@ -27,6 +27,9 @@ enum Cmd {
         zstd_level: i32,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Log every HTTP request: timestamp, method, url, status, response bytes, ms.
+        #[arg(long)]
+        debug: bool,
     },
     /// Initialize an empty data directory and exit.
     Init {
@@ -88,7 +91,7 @@ async fn main() -> Result<()> {
             println!("initialized");
             Ok(())
         }
-        Cmd::Serve { data_dir, bind, port, zstd_level, config } => {
+        Cmd::Serve { data_dir, bind, port, zstd_level, config, debug } => {
             let cfg = if let Some(p) = config {
                 let mut c = Config::load(&p)?;
                 c.data_dir = data_dir;
@@ -111,6 +114,7 @@ async fn main() -> Result<()> {
                 cluster_settings: parking_lot::RwLock::new(Default::default()),
             });
             arkimedb_http::init_http_log_from_env();
+            if debug { arkimedb_http::set_http_debug(true); }
             let app = router(state.clone()).layer(tower_http::trace::TraceLayer::new_for_http());
             let addr: std::net::SocketAddr = format!("{}:{}", cfg.http.bind, cfg.http.port).parse()?;
             tracing::info!("arkimedb listening on http://{addr}");
