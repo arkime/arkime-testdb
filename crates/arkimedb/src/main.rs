@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Serve { data_dir, bind, port, zstd_level, config, debug } => {
+            tracing::info!("arkimedb {} starting", env!("CARGO_PKG_VERSION"));
             let cfg = if let Some(p) = config {
                 let mut c = Config::load(&p)?;
                 c.data_dir = data_dir;
