@@ -142,6 +142,11 @@ pub fn router(state: Arc<AppState>) -> Router {
 async fn log_requests(req: Request<axum::body::Body>, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.to_string())
+        .unwrap_or_else(|| "-".to_string());
     // Check ?pretty (value-less or "true"/"1") before the request is consumed.
     let pretty = uri.query().map_or(false, |q| {
         q.split('&').any(|kv| {
@@ -175,8 +180,8 @@ async fn log_requests(req: Request<axum::body::Body>, next: Next) -> Response {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
         eprintln!(
-            "[debug] {} {} {} -> {} {}B ({:.2}ms)",
-            ts, method, uri, status, nbytes, dt.as_secs_f64() * 1000.0
+            "[debug] {} {} {} {} -> {} {}B ({:.2}ms)",
+            ts, peer, method, uri, status, nbytes, dt.as_secs_f64() * 1000.0
         );
         if pretty {
             let is_json = parts.headers
