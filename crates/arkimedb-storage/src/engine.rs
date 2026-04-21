@@ -420,64 +420,102 @@ impl Engine {
     }
 
     pub fn bulk_write(&self, default_collection: Option<&str>, ops: Vec<BulkOp>) -> Result<Vec<BulkOutcome>> {
-        let mut results: Vec<BulkOutcome> = Vec::with_capacity(ops.len());
-        // Walk the ops once, grouping contiguous same-collection Index/Create
-        // operations into a single redb write transaction. This removes the
-        // per-op begin_write()/commit() overhead (each commit is a small
-        // fdatasync-style queue + page table flush even under Durability::
-        // Eventual). Delete / Update still go through the single-op helpers
-        // so we don't change their semantics or the error shape clients see.
-        let mut i = 0;
-        while i < ops.len() {
-            let coll_name_opt = ops[i].collection.clone()
-                .or_else(|| default_collection.map(String::from))
-                .ok_or_else(|| Error::BadRequest("bulk op missing _index".into()))?;
-            // How many consecutive ops can we group?
-            let mut j = i;
-            let is_batchable = |op: &BulkOp| matches!(op.kind, BulkKind::Index{..} | BulkKind::Create{..});
-            let same_coll = |op: &BulkOp| {
-                let c = op.collection.as_deref()
-                    .or(default_collection)
-                    .unwrap_or("");
-                c == coll_name_opt
+        // Group ops by collection while remembering each op's original index
+        // so we can re-emit results in input order. ES `_bulk` response items
+        // are ordered positionally — clients index into them by position.
+        //
+        // Prior version only batched *contiguous* same-collection ops; but
+        // Arkime capture bulks frequently interleave 100+ daily sessions3-*
+        // collections, yielding one begin_write/commit per op (~35ms each
+        // for new-file creation). Grouping non-contiguous is safe as long
+        // as within-collection order is preserved (ES last-write-wins for
+        // same id holds trivially).
+        //
+        // Each collection is its own redb file, so commits across
+        // collections are independent — run them in parallel. This is a
+        // large win for bulks that create/touch many collections at once.
+        use rayon::prelude::*;
+        let n = ops.len();
+        let mut by_coll: ahash::AHashMap<String, Vec<(usize, BulkOp)>> = Default::default();
+        let mut fatal: Option<Error> = None;
+        for (idx, op) in ops.into_iter().enumerate() {
+            let coll = match op.collection.clone()
+                .or_else(|| default_collection.map(String::from)) {
+                Some(c) => c,
+                None => { fatal = Some(Error::BadRequest("bulk op missing _index".into())); break; }
             };
-            if is_batchable(&ops[i]) {
-                while j < ops.len() && is_batchable(&ops[j]) && same_coll(&ops[j]) {
-                    j += 1;
-                }
-            } else {
-                j = i + 1;
-            }
-
-            if j - i == 1 {
-                // single-op fallback (delete/update/singleton index) — keep old path
-                let op = &ops[i];
-                let col = self.ensure_collection(&coll_name_opt)?;
-                let res = match &op.kind {
-                    BulkKind::Index { id, source } => write_one(&col, &self.field_catalog, id.clone(), source.clone(), false),
-                    BulkKind::Create { id, source } => write_one(&col, &self.field_catalog, Some(id.clone()), source.clone(), true),
-                    BulkKind::Delete { id } => delete_one(&col, id),
-                    BulkKind::Update { id, doc } => update_one(&col, &self.field_catalog, id, doc.clone()),
-                };
-                results.push(match res {
-                    Ok(r) => BulkOutcome::ok(&coll_name_opt, r),
-                    Err(e) => BulkOutcome::err(&coll_name_opt, e),
-                });
-            } else {
-                // batched Index/Create on a single collection
-                let col = self.ensure_collection(&coll_name_opt)?;
-                let group: Vec<&BulkOp> = (i..j).map(|k| &ops[k]).collect();
-                let batch = write_many_in_one_tx(&col, &self.field_catalog, &group)?;
-                for r in batch {
-                    results.push(match r {
-                        Ok(br) => BulkOutcome::ok(&coll_name_opt, br),
-                        Err(e) => BulkOutcome::err(&coll_name_opt, e),
-                    });
-                }
-            }
-            i = j;
+            by_coll.entry(coll).or_default().push((idx, op));
         }
-        Ok(results)
+        if let Some(e) = fatal { return Err(e); }
+
+        // Pre-ensure all collections outside the parallel section so the
+        // engine's `collections` map is only mutated from this thread.
+        let mut coll_groups: Vec<(Arc<Collection>, Vec<(usize, BulkOp)>, String)> = Vec::with_capacity(by_coll.len());
+        for (name, group) in by_coll {
+            let col = self.ensure_collection(&name)?;
+            coll_groups.push((col, group, name));
+        }
+
+        // Parallel per-collection commits. Each closure returns
+        // Vec<(orig_idx, BulkOutcome)>.
+        let fc = self.field_catalog.clone();
+        let per_coll: Vec<Vec<(usize, BulkOutcome)>> = coll_groups
+            .into_par_iter()
+            .map(|(col, group, cname)| {
+                let mut out: Vec<(usize, BulkOutcome)> = Vec::with_capacity(group.len());
+                // Split the group into runs of Index/Create vs single Delete/Update.
+                // Batching runs of Index/Create uses one tx per run; Delete/Update
+                // use the single-op helpers (still one tx each, but on same col).
+                let mut i = 0;
+                while i < group.len() {
+                    let is_batchable = |op: &BulkOp| matches!(op.kind, BulkKind::Index{..} | BulkKind::Create{..});
+                    if is_batchable(&group[i].1) {
+                        let mut j = i;
+                        while j < group.len() && is_batchable(&group[j].1) { j += 1; }
+                        let refs: Vec<&BulkOp> = (i..j).map(|k| &group[k].1).collect();
+                        match write_many_in_one_tx(&col, &fc, &refs) {
+                            Ok(batch) => {
+                                for (k, r) in batch.into_iter().enumerate() {
+                                    let orig = group[i + k].0;
+                                    out.push((orig, match r {
+                                        Ok(br) => BulkOutcome::ok(&cname, br),
+                                        Err(e) => BulkOutcome::err(&cname, e),
+                                    }));
+                                }
+                            }
+                            Err(e) => {
+                                // tx-level failure: surface for every op in the batch
+                                for k in i..j {
+                                    let orig = group[k].0;
+                                    out.push((orig, BulkOutcome::err(&cname, Error::Io(std::io::Error::other(e.to_string())))));
+                                }
+                            }
+                        }
+                        i = j;
+                    } else {
+                        let (orig, op) = &group[i];
+                        let res = match &op.kind {
+                            BulkKind::Delete { id } => delete_one(&col, id),
+                            BulkKind::Update { id, doc } => update_one(&col, &fc, id, doc.clone()),
+                            _ => unreachable!(),
+                        };
+                        out.push((*orig, match res {
+                            Ok(r) => BulkOutcome::ok(&cname, r),
+                            Err(e) => BulkOutcome::err(&cname, e),
+                        }));
+                        i += 1;
+                    }
+                }
+                out
+            })
+            .collect();
+
+        // Re-emit in original op order.
+        let mut placed: Vec<Option<BulkOutcome>> = (0..n).map(|_| None).collect();
+        for chunk in per_coll {
+            for (orig, bo) in chunk { placed[orig] = Some(bo); }
+        }
+        Ok(placed.into_iter().map(|o| o.expect("bulk outcome slot")).collect())
     }
 
     /// Make recent writes visible to search.
@@ -559,7 +597,8 @@ fn open_collection(root: &Path, name: &str, schema: CollectionSchema, storage_cf
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
     let db = Database::create(&path).map_err(Error::from)?;
     // create tables
-    let w = db.begin_write()?;
+    let mut w = db.begin_write()?;
+    w.set_durability(redb::Durability::Eventual);
     {
         let _ = w.open_table(DOCS)?;
         let _ = w.open_table(ID2ROW)?;
