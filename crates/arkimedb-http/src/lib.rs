@@ -97,6 +97,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/_cat/count/:target",            get(cat_count_scoped))
         .route("/_cat/recovery",                 get(cat_recovery))
         .route("/_tasks",                        get(tasks_list))
+        // ILM / ISM (OpenSearch) — not implemented; return empty object
+        // so db.pl `esGet(..., 1)` + from_json() sees parseable JSON.
+        .route("/_ilm/policy",                    get(empty_object))
+        .route("/_ilm/policy/:name",              get(empty_object).put(empty_object).delete(empty_object))
+        .route("/_plugins/_ism/policies",         get(empty_object))
+        .route("/_plugins/_ism/policies/:name",   get(empty_object).put(empty_object).delete(empty_object))
         .route("/_alias",                        get(alias_list_all))
         .route("/_alias/:alias",                 get(alias_list_by))
         .route("/_bulk",                         post(bulk))
@@ -313,10 +319,18 @@ async fn nodes(State(_s): State<Arc<AppState>>) -> Response {
             "name": "arkimedb-0",
             "version": "7.10.10",
             "host": "127.0.0.1",
+            "hostname": "127.0.0.1",
             "ip": "127.0.0.1",
             "transport_address": "127.0.0.1:9300",
             "roles": ["master","data","ingest"],
             "attributes": {},
+            // db.pl dbCheck reads settings.config to print which file a
+            // warning applies to; also checks a few legacy settings.
+            "settings": {
+                "config": "arkimedb (embedded)",
+                "cluster.name": "arkimedb",
+                "node.name": "arkimedb-0"
+            },
             "thread_pool": {
                 "bulk":   { "queue_size": 200, "type": "fixed", "size": 1 },
                 "write":  { "queue_size": 200, "type": "fixed", "size": 1 },
@@ -381,15 +395,22 @@ async fn cat_indices_impl(target: Option<String>, s: Arc<AppState>, headers: Hea
     (StatusCode::OK, text).into_response()
 }
 
-async fn cat_aliases(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn cat_aliases(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
     let list = s.engine.catalog.list_aliases().unwrap_or_default();
-    if wants_json(&headers) {
+    if q.format.as_deref() == Some("json") || wants_json(&headers) {
         let arr: Vec<J> = list.into_iter().flat_map(|(a, ts)| ts.into_iter().map(move |t| json!({ "alias": a, "index": t }))).collect();
         return Json(arr).into_response();
     }
     let mut text = String::new();
     for (a, ts) in list { for t in ts { text.push_str(&format!("{a} {t}\n")); } }
     (StatusCode::OK, text).into_response()
+}
+
+/// Returns `{}` as JSON. Used for endpoints we don't implement (ILM/ISM)
+/// but which db.pl calls with its "dontcheck" flag + unconditional
+/// from_json() — an empty body would crash the parser.
+async fn empty_object() -> Response {
+    Json(json!({})).into_response()
 }
 
 fn wants_json(h: &HeaderMap) -> bool {
@@ -1740,7 +1761,9 @@ async fn nodes_stats(State(s): State<Arc<AppState>>) -> Response {
             "os":  { "cpu": { "percent": 0, "load_average": { "1m": 0.0, "5m": 0.0, "15m": 0.0 } },
                      "mem": { "total_in_bytes": 0, "free_in_bytes": 0, "used_in_bytes": 0 } },
             "process": { "cpu": { "percent": 0, "total_in_millis": 0 },
-                         "mem": { "total_virtual_in_bytes": 0 }, "open_file_descriptors": 0 },
+                         "mem": { "total_virtual_in_bytes": 0 },
+                         "open_file_descriptors": 0,
+                         "max_file_descriptors": 128000 },
             "jvm":    { "uptime_in_millis": uptime_ms,
                         "mem": { "heap_used_in_bytes": 0, "heap_used_percent": 0, "heap_committed_in_bytes": 0,
                                  "heap_max_in_bytes": 0, "non_heap_used_in_bytes": 0, "non_heap_committed_in_bytes": 0 } },
@@ -2196,8 +2219,8 @@ async fn cat_shards_impl(target: Option<String>, s: Arc<AppState>, headers: Head
     (StatusCode::OK, text).into_response()
 }
 
-async fn cat_aliases_scoped(Path(_pat): Path<String>, State(s): State<Arc<AppState>>, headers: HeaderMap, Query(_q): Query<CatQ>) -> Response {
-    cat_aliases(State(s), headers).await
+async fn cat_aliases_scoped(Path(_pat): Path<String>, State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
+    cat_aliases(State(s), headers, Query(q)).await
 }
 
 async fn alias_list_all(State(s): State<Arc<AppState>>) -> Response {
