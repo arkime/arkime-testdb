@@ -37,6 +37,20 @@ cargo build --release
 
 Then point Arkime at `http://localhost:9200` as you would Elasticsearch.
 
+### Prebuilt binaries
+
+Download from [Releases](https://github.com/arkime/arkime-testdb/releases).
+Linux amd64/arm64 and macOS arm64 are published.
+
+On macOS the downloaded binary is quarantined by Gatekeeper. Strip the
+quarantine attribute before first run:
+
+```sh
+xattr -d com.apple.quarantine arkimedb-macos-arm64
+chmod +x arkimedb-macos-arm64
+./arkimedb-macos-arm64 serve --data-dir ./data --port 9200
+```
+
 ### Useful flags
 
 | Flag | Description |
