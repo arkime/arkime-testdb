@@ -35,8 +35,14 @@ impl PostingsIndex {
         let pf_entry = pf.entry(field.to_string()).or_default();
         for s in values {
             let k = codec::encode_key(field, s);
+            // Only track the scalar in per_field the *first* time we see
+            // this (field, value). `entry.is_empty()` is wrong after a
+            // remove_row() drains the bitmap — re-inserting would duplicate
+            // the scalar in per_field, causing double-counting in
+            // terms-aggregation-style walks (see for_each_value).
+            let first_time = !map.contains_key(&k);
             let entry = map.entry(k).or_default();
-            if entry.is_empty() { pf_entry.push(s.clone()); }
+            if first_time { pf_entry.push(s.clone()); }
             entry.insert(row_id);
         }
     }
