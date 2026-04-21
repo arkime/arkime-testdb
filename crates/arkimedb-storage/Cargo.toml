@@ -1,0 +1,25 @@
+[package]
+name = "arkimedb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arkimedb-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+ahash.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+fst.workspace = true
+roaring.workspace = true
+zstd.workspace = true
+crc32fast.workspace = true
+memmap2.workspace = true
+redb.workspace = true
+rayon = "1.10"
+time.workspace = true

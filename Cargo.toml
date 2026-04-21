@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arkimedb-core",
+    "crates/arkimedb-storage",
+    "crates/arkimedb-query",
+    "crates/arkimedb-http",
+    "crates/arkimedb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# core
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+bytes = "1"
+smallvec = { version = "1", features = ["serde", "union"] }
+parking_lot = "0.12"
+ahash = "0.8"
+once_cell = "1"
+# async / http
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "decompression-gzip", "decompression-deflate"] }
+hyper = "1"
+# storage / encoding
+redb = "2"
+fst = "0.4"
+roaring = "0.10"
+zstd = "0.13"
+crc32fast = "1"
+memmap2 = "0.9"
+regex-automata = "0.4"
+# cli / config
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+# utility
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde-well-known"] }
+humantime = "2"
+uuid = { version = "1", features = ["v4"] }
+
+# intra-workspace
+arkimedb-core    = { path = "crates/arkimedb-core" }
+arkimedb-storage = { path = "crates/arkimedb-storage" }
+arkimedb-query   = { path = "crates/arkimedb-query" }
+arkimedb-http    = { path = "crates/arkimedb-http" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

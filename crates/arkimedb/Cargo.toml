@@ -1,0 +1,27 @@
+[package]
+name = "arkimedb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arkimedb"
+path = "src/main.rs"
+
+[dependencies]
+arkimedb-core.workspace = true
+arkimedb-storage.workspace = true
+arkimedb-query.workspace = true
+arkimedb-http.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+clap.workspace = true
+toml.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+ahash.workspace = true
+libc = "0.2"

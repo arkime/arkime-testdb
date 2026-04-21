@@ -1,0 +1,20 @@
+[package]
+name = "arkimedb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+ahash.workspace = true
+once_cell.workspace = true
+redb.workspace = true
+tracing.workspace = true
+time.workspace = true
+bytes.workspace = true
+toml.workspace = true
