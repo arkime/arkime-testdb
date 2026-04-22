@@ -78,6 +78,10 @@ pub struct Collection {
     /// sort-without-hydration. Built on first sort of a field; cleared on
     /// any write to the collection.
     pub sort_cache: RwLock<ahash::AHashMap<String, Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>>>,
+    /// Per-field (min, max) of the sort_cache values. Built alongside
+    /// sort_cache; cleared on any write. Enables cross-collection early-stop
+    /// when processing cols in extremum order for single-key sorts.
+    pub sort_range: RwLock<ahash::AHashMap<String, (arkimedb_core::Scalar, arkimedb_core::Scalar)>>,
     pub(crate) storage_cfg: StorageConfig,
     /// True if this collection's Database is shared with other
     /// collections (sessions-family). Writes to shared-DB collections
@@ -553,6 +557,11 @@ impl Engine {
     pub fn delete_collection(&self, name: &str) -> Result<bool> {
         let mut g = self.collections.write();
         let col = match g.remove(name) { Some(c) => c, None => return Ok(false) };
+        drop(g);
+        // Remove from persistent catalog & in-memory field catalog so it
+        // doesn't reappear on restart or linger in schema lookups.
+        let _ = self.catalog.unregister_collection(name);
+        self.field_catalog.remove(name);
         if col.shared_db {
             // Shared DB: don't delete the file — just drop this collection's tables.
             let mut w = col.db.begin_write()?;
@@ -698,6 +707,7 @@ fn open_collection(
         tombstones: RwLock::new(RoaringBitmap::new()),
         reindex_lock: RwLock::new(()),
         sort_cache: RwLock::new(ahash::AHashMap::new()),
+        sort_range: RwLock::new(ahash::AHashMap::new()),
         storage_cfg,
         shared_db: shared,
         tables,
@@ -809,6 +819,7 @@ fn write_one(col: &Arc<Collection>, fc: &Arc<FieldCatalog>, id: Option<String>, 
     let (row_id, created, version) = write_doc_in_tx(&w, &col.tables, &id, &compressed, require_create)?;
     w.commit()?;
     col.sort_cache.write().clear();
+    col.sort_range.write().clear();
     col.tombstones.write().remove(row_id);
     if !created {
         col.index.remove_row(row_id);
@@ -1073,7 +1084,7 @@ fn bulk_write_one_db(
         uniq.sort_by_key(|c| Arc::as_ptr(c) as usize);
         // Any bulk that touches a collection invalidates its sort_cache;
         // keep it simple and clear under the write lock we already hold.
-        for c in &uniq { c.sort_cache.write().clear(); }
+        for c in &uniq { c.sort_cache.write().clear(); c.sort_range.write().clear(); }
         uniq.into_iter().map(|c| {
             // SAFETY: the guard's lifetime is tied to the Collection which we
             // keep alive via the clones in `cols`. We leak the Arc into the

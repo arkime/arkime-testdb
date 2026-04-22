@@ -180,6 +180,10 @@ impl FieldCatalog {
         self.inner.write().insert(col.to_string(), schema);
     }
 
+    pub fn remove(&self, col: &str) -> bool {
+        self.inner.write().remove(col).is_some()
+    }
+
     pub fn ensure_collection(&self, col: &str) {
         let mut g = self.inner.write();
         g.entry(col.to_string()).or_default();

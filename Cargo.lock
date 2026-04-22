@@ -88,7 +88,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arkimedb"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ahash",
  "anyhow",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "arkimedb-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ahash",
  "anyhow",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "arkimedb-http"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ahash",
  "anyhow",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "arkimedb-query"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ahash",
  "anyhow",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "arkimedb-storage"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ahash",
  "anyhow",

@@ -278,6 +278,7 @@ async fn root(State(s): State<Arc<AppState>>) -> Response {
             "minimum_index_compatibility_version": "6.0.0"
         },
         "tagline": "You Know, for Search",
+        "arkimedb_version": env!("CARGO_PKG_VERSION"),
         "_uptime_s": s.start.elapsed().as_secs(),
     }));
     let mut resp = body.into_response();

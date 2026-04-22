@@ -201,7 +201,126 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
     let t0 = std::time::Instant::now();
     let q_json = req.query.clone().unwrap_or_else(|| serde_json::json!({"match_all": {}}));
 
-    // Compile + evaluate per collection (Phase A — server-side merge at the end).
+    // Aggregations (computed over the full matching set, not the page).
+    let aggs_result = if let Some(aj) = &req.aggs {
+        let spec = compile_aggs(aj)?;
+        Some(run_aggs(cols, &q_json, &spec)?)
+    } else { None };
+
+    // Fast path: single-key sort on a field that's indexed in every matched
+    // collection. Process collections in extremum order and early-stop once
+    // we've accumulated from+size hits AND the next collection's extremum
+    // cannot beat the current tail.
+    let single_sort = req.sort.as_ref().and_then(|s| if s.0.len() == 1 { s.0.first() } else { None });
+    let page_end = req.from + req.size;
+
+    if let Some(ss) = single_sort {
+        let t_start = std::time::Instant::now();
+        // Partition cols into (indexed-on-sort-field) vs (not): unindexed
+        // rows are treated as "missing" and go to one end based on missing_last.
+        let mut per_col_indexed: Vec<(Arc<Collection>, roaring::RoaringBitmap)> = Vec::new();
+        let mut per_col_unindexed: Vec<(Arc<Collection>, roaring::RoaringBitmap)> = Vec::new();
+        let mut total: u64 = 0;
+        for col in cols {
+            // Fast-skip empty collections.
+            if col.index.all_fields().is_empty() { continue; }
+            let q = compile_es_query(&q_json, col)?;
+            let _reidx = col.reindex_lock.read();
+            let bm = q.eval(col)?;
+            drop(_reidx);
+            total += bm.len();
+            if bm.is_empty() { continue; }
+            if col.index.field_type(&ss.field).is_some() {
+                per_col_indexed.push((col.clone(), bm));
+            } else {
+                per_col_unindexed.push((col.clone(), bm));
+            }
+        }
+        let _t_eval = t_start.elapsed();
+
+        if !per_col_indexed.is_empty() || !per_col_unindexed.is_empty() {
+            // Build sort_cache + sort_range for the field in each indexed col.
+            let mut per_col_info: Vec<(Arc<Collection>, roaring::RoaringBitmap,
+                                      Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>,
+                                      arkimedb_core::Scalar, arkimedb_core::Scalar)> =
+                Vec::with_capacity(per_col_indexed.len());
+            for (col, bm) in per_col_indexed.into_iter() {
+                let (map, min, max) = build_sort_cache(&col, &ss.field);
+                per_col_info.push((col, bm, map, min, max));
+            }
+
+            // Order cols by the extremum in sort direction.
+            // asc → sort by min asc; desc → sort by max desc.
+            per_col_info.sort_by(|a, b| {
+                let (amin, amax) = (&a.3, &a.4);
+                let (bmin, bmax) = (&b.3, &b.4);
+                if ss.ascending { cmp_scalar(amin, bmin) } else { cmp_scalar(bmax, amax) }
+            });
+
+            let mut out_hits: Vec<(Arc<Collection>, u32, Option<arkimedb_core::Scalar>)> = Vec::new();
+
+            // If unindexed cols exist and their rows sort to the FRONT
+            // (missing_first for asc, or missing_last==false; mirror for desc),
+            // prepend them. Otherwise append.
+            let missing_front = if ss.ascending { !ss.missing_last } else { !ss.missing_last };
+            if missing_front {
+                for (col, bm) in &per_col_unindexed {
+                    for r in bm.iter() { out_hits.push((col.clone(), r, None)); }
+                }
+            }
+
+            for (i, (col, bm, map, _min, _max)) in per_col_info.iter().enumerate() {
+                // Sort rows in this collection by the cached scalar.
+                let mut local: Vec<(u32, Option<arkimedb_core::Scalar>)> = bm.iter()
+                    .map(|r| (r, map.get(&r).cloned())).collect();
+                local.sort_by(|a, b| {
+                    let ord = cmp_scalar_opt(a.1.as_ref(), b.1.as_ref(), ss.missing_last);
+                    if ss.ascending { ord } else { ord.reverse() }
+                });
+                for (r, sc) in local { out_hits.push((col.clone(), r, sc)); }
+
+                // Early stop: need enough hits AND next col's best extremum
+                // can't beat current tail AND no unindexed "missing" rows
+                // need to be placed AFTER (would affect the page).
+                if out_hits.len() >= page_end && i + 1 < per_col_info.len() {
+                    let tail = &out_hits[page_end - 1].2;
+                    let next_best = if ss.ascending { &per_col_info[i + 1].3 } else { &per_col_info[i + 1].4 };
+                    let stop = match tail {
+                        Some(t) => {
+                            let ord = cmp_scalar(t, next_best);
+                            if ss.ascending { ord.is_lt() || ord.is_eq() } else { ord.is_gt() || ord.is_eq() }
+                        }
+                        None => false,
+                    };
+                    if stop { break; }
+                }
+            }
+
+            if !missing_front {
+                // Only materialize unindexed tail if page hasn't been filled
+                // entirely by indexed cols; otherwise these rows can't enter
+                // the page at all (they're beyond the tail).
+                if out_hits.len() < page_end {
+                    for (col, bm) in &per_col_unindexed {
+                        for r in bm.iter() { out_hits.push((col.clone(), r, None)); }
+                        if out_hits.len() >= page_end { break; }
+                    }
+                }
+            }
+
+            // Pagination.
+            let end = page_end.min(out_hits.len());
+            let start = req.from.min(end);
+            let slice_hits: Vec<(Arc<Collection>, u32)> = out_hits[start..end].iter()
+                .map(|(c, r, _)| (c.clone(), *r)).collect();
+
+            return hydrate_and_respond(cols, req, t0, slice_hits, total, aggs_result);
+        }
+
+        // Fall through to the generic slow path on truly empty case.
+    }
+
+    // Generic path: filter all, sort all, slice.
     let mut all_hits: Vec<(Arc<Collection>, u32)> = Vec::new();
     let mut total: u64 = 0;
     for col in cols {
@@ -213,21 +332,54 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
         for r in bm.iter() { all_hits.push((col.clone(), r)); }
     }
 
-    // Aggregations (computed over the full matching set, not the page).
-    let aggs_result = if let Some(aj) = &req.aggs {
-        let spec = compile_aggs(aj)?;
-        Some(run_aggs(cols, &q_json, &spec)?)
-    } else { None };
-
-    // Sort.
     if let Some(sort) = &req.sort {
         sort_hits(&mut all_hits, &sort.0)?;
     }
 
-    // Pagination.
     let end = (req.from + req.size).min(all_hits.len());
     let start = req.from.min(end);
-    let slice = &all_hits[start..end];
+    let slice: Vec<(Arc<Collection>, u32)> = all_hits[start..end].to_vec();
+
+    hydrate_and_respond(cols, req, t0, slice, total, aggs_result)
+}
+
+/// Build (or fetch from cache) the row->Scalar map and (min, max) range
+/// for `field` on `col`. The per-collection sort_cache/sort_range are
+/// cleared on any write to the collection.
+fn build_sort_cache(col: &Arc<Collection>, field: &str)
+    -> (Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>, arkimedb_core::Scalar, arkimedb_core::Scalar)
+{
+    if let Some(m) = col.sort_cache.read().get(field) {
+        if let Some((lo, hi)) = col.sort_range.read().get(field) {
+            return (m.clone(), lo.clone(), hi.clone());
+        }
+    }
+    let mut m: ahash::AHashMap<u32, arkimedb_core::Scalar> = ahash::AHashMap::new();
+    let mut lo: Option<arkimedb_core::Scalar> = None;
+    let mut hi: Option<arkimedb_core::Scalar> = None;
+    col.index.for_each_value(field, |sc, bm| {
+        if bm.is_empty() { return; }
+        match &lo { None => lo = Some(sc.clone()), Some(cur) => if cmp_scalar(sc, cur).is_lt() { lo = Some(sc.clone()); } }
+        match &hi { None => hi = Some(sc.clone()), Some(cur) => if cmp_scalar(sc, cur).is_gt() { hi = Some(sc.clone()); } }
+        for r in bm.iter() { m.entry(r).or_insert_with(|| sc.clone()); }
+    });
+    let lo = lo.unwrap_or(arkimedb_core::Scalar::Null);
+    let hi = hi.unwrap_or(arkimedb_core::Scalar::Null);
+    let arc = Arc::new(m);
+    col.sort_cache.write().insert(field.to_string(), arc.clone());
+    col.sort_range.write().insert(field.to_string(), (lo.clone(), hi.clone()));
+    (arc, lo, hi)
+}
+
+fn hydrate_and_respond(
+    cols: &[Arc<Collection>],
+    req: &SearchRequest,
+    t0: std::time::Instant,
+    slice_hits: Vec<(Arc<Collection>, u32)>,
+    total: u64,
+    aggs_result: Option<crate::aggs::AggResult>,
+) -> Result<SearchResponse> {
+    let slice = slice_hits.as_slice();
 
     // Hydrate. Group hits by collection and batch-load via a single read tx
     // per collection to avoid `begin_read()` * 2 per hit.
