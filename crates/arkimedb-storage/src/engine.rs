@@ -717,10 +717,28 @@ fn write_doc_in_tx(
 ) -> Result<(u32, bool, u64)> {
     let mut id2row = w.open_table(t.id2row)?;
     let existing = id2row.get(id)?.map(|v| v.value());
-    let (row_id, created) = match existing {
+    // A prior delete tombstones the row but leaves id2row mapped. Treat a
+    // tombstoned id as non-existent on create; reuse the row_id and clear
+    // the on-disk tombstone (postings-side tombstone is cleared by caller).
+    let tombstoned = match existing {
         Some(r) => {
+            let tt = w.open_table(t.tombstones)?;
+            let v = tt.get(r)?.is_some();
+            drop(tt);
+            v
+        }
+        None => false,
+    };
+    let (row_id, created) = match existing {
+        Some(r) if !tombstoned => {
             if require_create { return Err(Error::Conflict(format!("document already exists: {id}"))); }
             (r, false)
+        }
+        Some(r) => {
+            // Resurrecting a tombstoned row.
+            let mut tt = w.open_table(t.tombstones)?;
+            tt.remove(r)?;
+            (r, true)
         }
         None => {
             let mut meta = w.open_table(t.meta)?;
