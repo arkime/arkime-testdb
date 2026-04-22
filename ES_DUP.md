@@ -642,17 +642,43 @@ The real ES default is not a per-commit fsync either; its
 write buffers and async flush. `refresh=true` is about visibility,
 not durability.
 
-### 2. `refresh` is a no-op if your backend already makes writes visible
+### 2. `refresh` is a **barrier**, not a no-op, on a write-visible backend
 
 ES's `refresh` exists because Lucene batches writes into an in-memory
 buffer that isn't searchable until flushed into a searcher segment.
 If your backend writes directly to the queryable index (our redb +
-in-memory postings do), `_refresh`, `_flush`, and
-`?refresh=true|wait_for` are all no-ops — and should literally return
-immediately without doing anything.
+in-memory postings do), a *single-threaded* client would see
+`_refresh` as entirely unnecessary.
 
-This took us from 184s → 175s because the original impl was
-*re-persisting already-persisted tombstones* on every `_refresh`.
+But real clients (Arkime's `/api/sessions/addtags` and friends) fire
+**concurrent** `_update` calls via `async.eachLimit`, then await
+`Db.refresh('sessions*')` before returning to the caller. The client
+treats the refresh response as a synchronization edge: "after this
+returns, every write I just issued is visible." If refresh is a
+no-op, a followup query can race ahead of one of the concurrent
+bulks' post-commit postings update — and you see
+`expected 3, got 2` flakes on tagging tests.
+
+Implementation: in `Engine::refresh(target)`, resolve matching
+collections, sort by Arc pointer (same order bulk_write uses), and
+for each one briefly acquire and release
+`reindex_lock.write()`. Because bulk holds that lock from
+`begin_write()` through the post-commit postings update, the
+acquisition succeeds only after all prior bulks on that collection
+have fully applied. Then release. Total cost when idle: a few
+uncontended atomic ops per collection.
+
+Caller: wrap the HTTP handler in `spawn_blocking` — refresh can now
+block briefly on an ongoing bulk, and you don't want to stall a
+tokio worker for that.
+
+This is also cheaper than making every read take
+`reindex_lock.read()`: readers never wait, only the occasional
+explicit `_refresh` (which is what the client asked for) does.
+
+Original impl re-persisted already-persisted tombstones on every
+`_refresh`, which wasted 9s on the full tests.pl run (184→175s).
+Don't do that either — refresh is a pure barrier, no I/O.
 
 ### 3. Bulk writes: group contiguous same-collection ops into one
 transaction (−small but removes a future bottleneck)
