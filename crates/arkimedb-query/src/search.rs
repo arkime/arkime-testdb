@@ -490,39 +490,83 @@ fn extract_dotted(doc: &J, path: &str) -> Option<J> {
 }
 
 fn sort_hits(hits: &mut Vec<(Arc<Collection>, u32)>, sort: &[SortSpec]) -> Result<()> {
-    // Pre-load every hit's _source ONCE (one read tx per collection), then
-    // do a pure in-memory sort. Avoids reopening redb per comparator call,
-    // which was O(n log n) tx opens on a large hit set.
+    // Build per-collection row_id -> sort_value maps for each sort field
+    // by scanning the postings index. Avoids hydrating every hit's full
+    // _source just to compare one field.
     let mut col_ids: ahash::AHashMap<*const Collection, usize> = ahash::AHashMap::new();
-    let mut by_col: Vec<(Arc<Collection>, Vec<u32>, Vec<usize>)> = Vec::new();
-    for (i, (c, rid)) in hits.iter().enumerate() {
+    let mut by_col: Vec<Arc<Collection>> = Vec::new();
+    for (c, _) in hits.iter() {
         let p = Arc::as_ptr(c);
-        if let Some(&cid) = col_ids.get(&p) {
-            by_col[cid].1.push(*rid);
-            by_col[cid].2.push(i);
-        } else {
+        if !col_ids.contains_key(&p) {
             col_ids.insert(p, by_col.len());
-            by_col.push((c.clone(), vec![*rid], vec![i]));
+            by_col.push(c.clone());
         }
     }
+
+    // For each (collection, sort field) get a row -> Scalar map, using the
+    // per-collection sort_cache. First sort of a field builds it; subsequent
+    // sorts reuse. Writes to the collection clear the cache.
+    let mut col_field_vals: Vec<Vec<Option<Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>>>> =
+        vec![vec![None; sort.len()]; by_col.len()];
+    for (ci, col) in by_col.iter().enumerate() {
+        for (si, s) in sort.iter().enumerate() {
+            if col.index.field_type(&s.field).is_none() { continue; }
+            if let Some(m) = col.sort_cache.read().get(&s.field) {
+                col_field_vals[ci][si] = Some(m.clone());
+                continue;
+            }
+            let mut m = ahash::AHashMap::new();
+            col.index.for_each_value(&s.field, |sc, bm| {
+                for r in bm.iter() { m.entry(r).or_insert_with(|| sc.clone()); }
+            });
+            let arc = Arc::new(m);
+            col.sort_cache.write().insert(s.field.clone(), arc.clone());
+            col_field_vals[ci][si] = Some(arc);
+        }
+    }
+    let col_field_indexed: Vec<Vec<bool>> = col_field_vals.iter()
+        .map(|v| v.iter().map(|o| o.is_some()).collect())
+        .collect();
+
+    // Fallback: hydrate _source only for rows where at least one sort field
+    // is NOT in the postings index. Hopefully rare.
+    let need_fallback = col_field_indexed.iter().any(|v| v.iter().any(|b| !*b));
     let mut docs: Vec<Option<serde_json::Value>> = vec![None; hits.len()];
     let mut ids: Vec<String> = vec![String::new(); hits.len()];
-    for (col, rows, slots) in &by_col {
-        let loaded = col.hydrate_rows(rows, true, true)?;
-        for (k, slot) in slots.iter().enumerate() {
-            let (id_opt, raw_opt) = &loaded[k];
-            ids[*slot] = id_opt.clone().unwrap_or_default();
-            docs[*slot] = raw_opt.as_ref()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+    if need_fallback {
+        let mut by_col_slots: Vec<Vec<(u32, usize)>> = vec![Vec::new(); by_col.len()];
+        for (i, (c, rid)) in hits.iter().enumerate() {
+            let ci = col_ids[&Arc::as_ptr(c)];
+            by_col_slots[ci].push((*rid, i));
+        }
+        for (ci, col) in by_col.iter().enumerate() {
+            let rows: Vec<u32> = by_col_slots[ci].iter().map(|(r, _)| *r).collect();
+            let loaded = col.hydrate_rows(&rows, true, true)?;
+            for (k, (_, slot)) in by_col_slots[ci].iter().enumerate() {
+                let (id_opt, raw_opt) = &loaded[k];
+                ids[*slot] = id_opt.clone().unwrap_or_default();
+                docs[*slot] = raw_opt.as_ref()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+            }
         }
     }
-    // Permutation sort (indices) so we don't have to clone `(Arc<Collection>, u32)` repeatedly.
+
     let mut perm: Vec<usize> = (0..hits.len()).collect();
     perm.sort_by(|&ai, &bi| {
-        for s in sort {
-            let av = docs[ai].as_ref().and_then(|v| v.get(&s.field));
-            let bv = docs[bi].as_ref().and_then(|v| v.get(&s.field));
-            let ord = cmp_json(av, bv, s.missing_last);
+        let (ca, ra) = &hits[ai];
+        let (cb, rb) = &hits[bi];
+        let cai = col_ids[&Arc::as_ptr(ca)];
+        let cbi = col_ids[&Arc::as_ptr(cb)];
+        for (si, s) in sort.iter().enumerate() {
+            let a_sc = col_field_vals[cai][si].as_ref().and_then(|m| m.get(ra));
+            let b_sc = col_field_vals[cbi][si].as_ref().and_then(|m| m.get(rb));
+            let ord = if col_field_indexed[cai][si] && col_field_indexed[cbi][si] {
+                cmp_scalar_opt(a_sc, b_sc, s.missing_last)
+            } else {
+                let av = docs[ai].as_ref().and_then(|v| v.get(&s.field));
+                let bv = docs[bi].as_ref().and_then(|v| v.get(&s.field));
+                cmp_json(av, bv, s.missing_last)
+            };
             if ord != std::cmp::Ordering::Equal {
                 return if s.ascending { ord } else { ord.reverse() };
             }
@@ -532,6 +576,39 @@ fn sort_hits(hits: &mut Vec<(Arc<Collection>, u32)>, sort: &[SortSpec]) -> Resul
     let reordered: Vec<(Arc<Collection>, u32)> = perm.into_iter().map(|i| hits[i].clone()).collect();
     *hits = reordered;
     Ok(())
+}
+
+fn cmp_scalar_opt(a: Option<&arkimedb_core::Scalar>, b: Option<&arkimedb_core::Scalar>, missing_last: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (None, None) => Equal,
+        (None, _) => if missing_last { Greater } else { Less },
+        (_, None) => if missing_last { Less } else { Greater },
+        (Some(x), Some(y)) => cmp_scalar(x, y),
+    }
+}
+
+fn cmp_scalar(a: &arkimedb_core::Scalar, b: &arkimedb_core::Scalar) -> std::cmp::Ordering {
+    use arkimedb_core::Scalar::*;
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (I64(x), I64(y)) => x.cmp(y),
+        (U64(x), U64(y)) => x.cmp(y),
+        (I64(x), U64(y)) => (*x as i128).cmp(&(*y as i128)),
+        (U64(x), I64(y)) => (*x as i128).cmp(&(*y as i128)),
+        (I64(x), F64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
+        (F64(x), I64(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
+        (U64(x), F64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
+        (F64(x), U64(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
+        (F64(x), F64(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (Ts(x), Ts(y)) => x.cmp(y),
+        (Ts(x), I64(y)) => x.cmp(y),
+        (I64(x), Ts(y)) => x.cmp(y),
+        (Ip(x), Ip(y)) => x.cmp(y),
+        (Str(x), Str(y)) => x.cmp(y),
+        (Bool(x), Bool(y)) => x.cmp(y),
+        _ => Equal,
+    }
 }
 
 fn cmp_json(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>, missing_last: bool) -> std::cmp::Ordering {

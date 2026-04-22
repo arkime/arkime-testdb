@@ -74,6 +74,10 @@ pub struct Collection {
     /// a read guard so they never observe a row temporarily missing from
     /// postings mid-reindex.
     pub reindex_lock: RwLock<()>,
+    /// Lazily-built cache: field name -> (row_id -> Scalar value) used for
+    /// sort-without-hydration. Built on first sort of a field; cleared on
+    /// any write to the collection.
+    pub sort_cache: RwLock<ahash::AHashMap<String, Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>>>,
     pub(crate) storage_cfg: StorageConfig,
     /// True if this collection's Database is shared with other
     /// collections (sessions-family). Writes to shared-DB collections
@@ -693,6 +697,7 @@ fn open_collection(
         schema: RwLock::new(schema),
         tombstones: RwLock::new(RoaringBitmap::new()),
         reindex_lock: RwLock::new(()),
+        sort_cache: RwLock::new(ahash::AHashMap::new()),
         storage_cfg,
         shared_db: shared,
         tables,
@@ -785,6 +790,7 @@ fn write_one(col: &Arc<Collection>, fc: &Arc<FieldCatalog>, id: Option<String>, 
     w.set_durability(redb::Durability::Eventual);
     let (row_id, created, version) = write_doc_in_tx(&w, &col.tables, &id, &compressed, require_create)?;
     w.commit()?;
+    col.sort_cache.write().clear();
     col.tombstones.write().remove(row_id);
     if !created {
         col.index.remove_row(row_id);
@@ -1047,6 +1053,9 @@ fn bulk_write_one_db(
             if seen.insert(Arc::as_ptr(c) as usize) { uniq.push(c.clone()); }
         }
         uniq.sort_by_key(|c| Arc::as_ptr(c) as usize);
+        // Any bulk that touches a collection invalidates its sort_cache;
+        // keep it simple and clear under the write lock we already hold.
+        for c in &uniq { c.sort_cache.write().clear(); }
         uniq.into_iter().map(|c| {
             // SAFETY: the guard's lifetime is tied to the Collection which we
             // keep alive via the clones in `cols`. We leak the Arc into the

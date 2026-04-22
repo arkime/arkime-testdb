@@ -73,6 +73,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/_cluster/health",               get(cluster_health))
         .route("/_cluster/health/:target",       get(cluster_health_scoped))
         .route("/_cluster/state",                get(cluster_state))
+        .route("/_cat",                          get(cat_index))
         .route("/_cat/indices",                  get(cat_indices_all))
         .route("/_cat/indices/:target",          get(cat_indices_scoped))
         .route("/_cat/aliases",                  get(cat_aliases))
@@ -149,6 +150,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/:idx/_mget",                    post(mget_scoped).get(mget_scoped))
         .layer(middleware::from_fn(log_requests))
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -363,7 +365,55 @@ async fn cluster_stats(State(s): State<Arc<AppState>>) -> Response {
 }
 
 #[derive(Deserialize, Default)]
-struct CatQ { format: Option<String>, active_only: Option<String> }
+struct CatQ {
+    format: Option<String>,
+    active_only: Option<String>,
+    #[serde(default, deserialize_with = "de_flag")]
+    v: bool,
+}
+
+// Accept ?v, ?v=, ?v=true, ?v=1 — ES-style flag param.
+fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+    let s: Option<String> = Option::deserialize(d)?;
+    Ok(match s.as_deref() {
+        Some("") | Some("true") | Some("1") | Some("yes") | None => true,
+        _ => false,
+    })
+}
+
+async fn cat_index() -> Response {
+    // Matches Elasticsearch's /_cat help text.
+    let body = "=^.^=\n\
+/_cat/allocation\n\
+/_cat/shards\n\
+/_cat/shards/{index}\n\
+/_cat/master\n\
+/_cat/nodes\n\
+/_cat/tasks\n\
+/_cat/indices\n\
+/_cat/indices/{index}\n\
+/_cat/segments\n\
+/_cat/segments/{index}\n\
+/_cat/count\n\
+/_cat/count/{index}\n\
+/_cat/recovery\n\
+/_cat/recovery/{index}\n\
+/_cat/health\n\
+/_cat/pending_tasks\n\
+/_cat/aliases\n\
+/_cat/aliases/{alias}\n\
+/_cat/thread_pool\n\
+/_cat/thread_pool/{thread_pools}\n\
+/_cat/plugins\n\
+/_cat/fielddata\n\
+/_cat/fielddata/{fields}\n\
+/_cat/nodeattrs\n\
+/_cat/repositories\n\
+/_cat/snapshots/{repository}\n\
+/_cat/templates\n\
+/_cat/templates/{name}\n";
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=UTF-8")], body).into_response()
+}
 
 async fn cat_indices_all(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
     cat_indices_impl(None, s, headers, q).await
@@ -392,14 +442,59 @@ async fn cat_indices_impl(target: Option<String>, s: Arc<AppState>, headers: Hea
         }).collect();
         return Json(arr).into_response();
     }
-    let mut text = String::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for n in names {
         let c = match s.engine.get_collection(&n) { Some(c) => c, None => continue };
         let docs = c.row_count().unwrap_or(0);
         let size = std::fs::metadata(&c.path).map(|m| m.len()).unwrap_or(0);
-        text.push_str(&format!("green open {n} {n} 1 0 {docs} 0 {size} {size}\n"));
+        rows.push(vec![
+            "green".into(), "open".into(), n.clone(), n,
+            "1".into(), "0".into(),
+            docs.to_string(), "0".into(), size.to_string(),
+        ]);
     }
+    let headers_row = ["health","status","index","uuid","pri","rep","docs.count","docs.deleted","store.size"];
+    let right_just  = [false,false,false,false,true,true,true,true,true];
+    let text = render_cat_table(&headers_row, &right_just, &rows, q.v);
     (StatusCode::OK, text).into_response()
+}
+
+fn render_cat_table(
+    headers: &[&str],
+    right_just: &[bool],
+    rows: &[Vec<String>],
+    show_header: bool,
+) -> String {
+    let n = headers.len();
+    let mut widths = vec![0usize; n];
+    if show_header {
+        for i in 0..n { widths[i] = headers[i].len(); }
+    }
+    for r in rows {
+        for i in 0..n.min(r.len()) { if r[i].len() > widths[i] { widths[i] = r[i].len(); } }
+    }
+    let mut out = String::new();
+    let emit_row = |out: &mut String, cells: &[&str]| {
+        for i in 0..n {
+            let cell = cells.get(i).copied().unwrap_or("");
+            let pad = widths[i].saturating_sub(cell.len());
+            if right_just[i] {
+                for _ in 0..pad { out.push(' '); }
+                out.push_str(cell);
+            } else {
+                out.push_str(cell);
+                if i + 1 < n { for _ in 0..pad { out.push(' '); } }
+            }
+            if i + 1 < n { out.push(' '); }
+        }
+        out.push('\n');
+    };
+    if show_header { emit_row(&mut out, headers); }
+    for r in rows {
+        let refs: Vec<&str> = r.iter().map(|s| s.as_str()).collect();
+        emit_row(&mut out, &refs);
+    }
+    out
 }
 
 async fn cat_aliases(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
@@ -408,9 +503,12 @@ async fn cat_aliases(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q
         let arr: Vec<J> = list.into_iter().flat_map(|(a, ts)| ts.into_iter().map(move |t| json!({ "alias": a, "index": t }))).collect();
         return Json(arr).into_response();
     }
-    let mut text = String::new();
-    for (a, ts) in list { for t in ts { text.push_str(&format!("{a} {t}\n")); } }
-    (StatusCode::OK, text).into_response()
+    let rows: Vec<Vec<String>> = list.into_iter()
+        .flat_map(|(a, ts)| ts.into_iter().map(move |t| vec![a.clone(), t]))
+        .collect();
+    let headers_row = ["alias","index"];
+    let right_just = [false,false];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 /// Returns `{}` as JSON. Used for endpoints we don't implement (ILM/ISM)
@@ -2039,12 +2137,18 @@ async fn cat_recovery(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(
     if want_json {
         return Json(J::Array(rows)).into_response();
     }
-    let mut out = String::new();
-    for r in &rows {
-        out.push_str(&format!("{} 0 0ms existing_store done n/a n/a 127.0.0.1 arkimedb-0 n/a n/a 0 0 100.0% 0 0 0 100.0% 0 0 0 100.0%\n",
-            r.get("index").and_then(|v| v.as_str()).unwrap_or("")));
-    }
-    (StatusCode::OK, out).into_response()
+    let table_rows: Vec<Vec<String>> = rows.iter().map(|r| vec![
+        r.get("index").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        "0".into(), "0ms".into(), "existing_store".into(), "done".into(),
+        "n/a".into(), "n/a".into(), "127.0.0.1".into(), "arkimedb-0".into(),
+        "n/a".into(), "n/a".into(),
+        "0".into(), "0".into(), "100.0%".into(), "0".into(),
+        "0".into(), "0".into(), "100.0%".into(), "0".into(),
+        "0".into(), "0".into(), "100.0%".into(),
+    ]).collect();
+    let headers_row = ["index","shard","time","type","stage","source_host","source_node","target_host","target_node","repository","snapshot","files","files_recovered","files_percent","files_total","bytes","bytes_recovered","bytes_percent","bytes_total","translog_ops","translog_ops_recovered","translog_ops_percent"];
+    let right_just = [false,true,true,false,false,false,false,false,false,false,false,true,true,true,true,true,true,true,true,true,true,true];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &table_rows, q.v)).into_response()
 }
 
 async fn tasks_list(State(_s): State<Arc<AppState>>, Query(_q): Query<CatQ>) -> Response {
@@ -2090,7 +2194,13 @@ async fn cat_nodes(State(_s): State<Arc<AppState>>, headers: HeaderMap, Query(q)
             "master": "*"
         }])).into_response();
     }
-    (StatusCode::OK, "arkimedb-0 127.0.0.1 0 0 0 mdi * arkimedb-0\n").into_response()
+    let rows = vec![vec![
+        "127.0.0.1".into(), "0".into(), "0".into(), "0".into(),
+        "mdi".into(), "*".into(), "arkimedb-0".into(),
+    ]];
+    let headers_row = ["ip","heap.percent","ram.percent","cpu","node.role","master","name"];
+    let right_just  = [false,true,true,true,false,false,false];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 async fn cat_allocation(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
@@ -2109,7 +2219,13 @@ async fn cat_allocation(State(s): State<Arc<AppState>>, headers: HeaderMap, Quer
             "node": "arkimedb-0"
         }])).into_response();
     }
-    (StatusCode::OK, format!("{} 0 0 0 0 0 127.0.0.1 127.0.0.1 arkimedb-0\n", n)).into_response()
+    let rows = vec![vec![
+        n.to_string(), "0".into(), "0".into(), "0".into(), "0".into(), "0".into(),
+        "127.0.0.1".into(), "127.0.0.1".into(), "arkimedb-0".into(),
+    ]];
+    let headers_row = ["shards","disk.indices","disk.used","disk.avail","disk.total","disk.percent","host","ip","node"];
+    let right_just  = [true,true,true,true,true,true,false,false,false];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 async fn cat_health(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
@@ -2140,11 +2256,14 @@ async fn cat_health(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q)
             "active_shards_percent": "100.0%"
         }])).into_response();
     }
-    let line = format!(
-        "{} {} arkimedb green 1 1 {} {} 0 0 0 0 - 100.0%\n",
-        ts_secs, ts_str, n, n
-    );
-    (StatusCode::OK, line).into_response()
+    let rows = vec![vec![
+        ts_secs.to_string(), ts_str, "arkimedb".into(), "green".into(),
+        "1".into(), "1".into(), n.to_string(), n.to_string(),
+        "0".into(), "0".into(), "0".into(), "0".into(), "-".into(), "100.0%".into(),
+    ]];
+    let headers_row = ["epoch","timestamp","cluster","status","node.total","node.data","shards","pri","relo","init","unassign","pending_tasks","max_task_wait_time","active_shards_percent"];
+    let right_just  = [true,false,false,false,true,true,true,true,true,true,true,true,false,true];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 async fn cat_master(State(_s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
@@ -2157,7 +2276,12 @@ async fn cat_master(State(_s): State<Arc<AppState>>, headers: HeaderMap, Query(q
             "node": "arkimedb-0"
         }])).into_response();
     }
-    (StatusCode::OK, "arkimedb-0 127.0.0.1 127.0.0.1 arkimedb-0\n").into_response()
+    let rows = vec![vec![
+        "arkimedb-0".into(), "127.0.0.1".into(), "127.0.0.1".into(), "arkimedb-0".into(),
+    ]];
+    let headers_row = ["id","host","ip","node"];
+    let right_just  = [false,false,false,false];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 async fn cat_count_all(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
@@ -2185,7 +2309,10 @@ async fn cat_count_impl(target: Option<String>, s: Arc<AppState>, headers: Heade
             "count": total.to_string()
         }])).into_response();
     }
-    (StatusCode::OK, format!("{} - {}\n", ts_secs, total)).into_response()
+    let rows = vec![vec![ts_secs.to_string(), "-".into(), total.to_string()]];
+    let headers_row = ["epoch","timestamp","count"];
+    let right_just  = [true,false,true];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 async fn cat_templates(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
@@ -2219,9 +2346,12 @@ async fn cat_templates_impl(pat: Option<String>, s: Arc<AppState>, headers: Head
         })).collect();
         return Json(arr).into_response();
     }
-    let mut text = String::new();
-    for n in &filtered { text.push_str(&format!("{n} [] 0 \n")); }
-    (StatusCode::OK, text).into_response()
+    let rows: Vec<Vec<String>> = filtered.iter().map(|n| vec![
+        n.clone(), "[]".into(), "0".into(), String::new(),
+    ]).collect();
+    let headers_row = ["name","index_patterns","order","version"];
+    let right_just  = [false,false,true,true];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 async fn cat_shards_all(State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {
@@ -2245,12 +2375,17 @@ async fn cat_shards_impl(target: Option<String>, s: Arc<AppState>, headers: Head
         }).collect();
         return Json(arr).into_response();
     }
-    let mut text = String::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for n in names {
         let docs = s.engine.get_collection(&n).and_then(|c| c.row_count().ok()).unwrap_or(0);
-        text.push_str(&format!("{n} 0 p STARTED {docs} 0 127.0.0.1 arkimedb-0\n"));
+        rows.push(vec![
+            n, "0".into(), "p".into(), "STARTED".into(),
+            docs.to_string(), "0".into(), "127.0.0.1".into(), "arkimedb-0".into(),
+        ]);
     }
-    (StatusCode::OK, text).into_response()
+    let headers_row = ["index","shard","prirep","state","docs","store","ip","node"];
+    let right_just  = [false,true,false,false,true,true,false,false];
+    (StatusCode::OK, render_cat_table(&headers_row, &right_just, &rows, q.v)).into_response()
 }
 
 async fn cat_aliases_scoped(Path(_pat): Path<String>, State(s): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<CatQ>) -> Response {

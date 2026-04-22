@@ -120,7 +120,34 @@ async fn main() -> Result<()> {
             let app = router(state.clone()).layer(tower_http::trace::TraceLayer::new_for_http());
             let addr: std::net::SocketAddr = format!("{}:{}", cfg.http.bind, cfg.http.port).parse()?;
             tracing::info!("arkimedb listening on http://{addr}");
-            let listener = tokio::net::TcpListener::bind(addr).await?;
+            // Build the listener with a large accept backlog so bursts of
+            // connections (e.g. many capture nodes reconnecting) don't get
+            // refused.  macOS defaults to 128, Linux to 4096; use 8192.
+            //
+            // When the user asked for "0.0.0.0", listen on IPv6 `::` with
+            // V6ONLY=off so we serve both IPv4 and IPv6 clients — otherwise
+            // clients that resolve `localhost` to `::1` first get
+            // ECONNREFUSED.
+            let listen_any_v4 = matches!(addr.ip(), std::net::IpAddr::V4(v4) if v4.is_unspecified());
+            let (domain, bind_addr): (socket2::Domain, std::net::SocketAddr) = if listen_any_v4 {
+                (socket2::Domain::IPV6,
+                 std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), addr.port()))
+            } else if addr.is_ipv6() {
+                (socket2::Domain::IPV6, addr)
+            } else {
+                (socket2::Domain::IPV4, addr)
+            };
+            let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            sock.set_reuse_address(true)?;
+            if domain == socket2::Domain::IPV6 {
+                // Accept IPv4 clients on the dual-stack socket too.
+                let _ = sock.set_only_v6(false);
+            }
+            sock.set_nonblocking(true)?;
+            sock.bind(&bind_addr.into())?;
+            sock.listen(8192)?;
+            let std_listener: std::net::TcpListener = sock.into();
+            let listener = tokio::net::TcpListener::from_std(std_listener)?;
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

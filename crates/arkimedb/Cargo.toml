@@ -25,3 +25,4 @@ tracing-subscriber.workspace = true
 parking_lot.workspace = true
 ahash.workspace = true
 libc = "0.2"
+socket2 = "0.6.3"
