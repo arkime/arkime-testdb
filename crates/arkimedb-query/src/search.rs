@@ -225,9 +225,11 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
             // Fast-skip empty collections.
             if col.index.all_fields().is_empty() { continue; }
             let q = compile_es_query(&q_json, col)?;
-            let _reidx = col.reindex_lock.read();
+            // No reindex_lock here: stale reads during bulk indexing are
+            // acceptable (ES semantics — data before last refresh may not
+            // appear in search). Individual postings structures are guarded
+            // by their own per-map RwLocks.
             let bm = q.eval(col)?;
-            drop(_reidx);
             total += bm.len();
             if bm.is_empty() { continue; }
             if col.index.field_type(&ss.field).is_some() {
@@ -325,9 +327,8 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
     let mut total: u64 = 0;
     for col in cols {
         let q = compile_es_query(&q_json, col)?;
-        let _reidx = col.reindex_lock.read();
+        // Search never blocks on the reindex_lock; see note in the fast path.
         let bm = q.eval(col)?;
-        drop(_reidx);
         total += bm.len();
         for r in bm.iter() { all_hits.push((col.clone(), r)); }
     }

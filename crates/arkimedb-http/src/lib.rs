@@ -1159,9 +1159,7 @@ async fn count_cols(cols: Vec<std::sync::Arc<arkimedb_storage::Collection>>, bod
     } else {
         for c in &cols {
             let q = match arkimedb_query::compile_es_query(&query_json, c) { Ok(v) => v, Err(e) => return internal(e) };
-            let _reidx = c.reindex_lock.read();
             let bm = match q.eval(c) { Ok(v) => v, Err(e) => return internal(e) };
-            drop(_reidx);
             total += bm.len();
         }
     }
@@ -1195,9 +1193,7 @@ async fn delete_by_query(
 
     for c in &cols {
         let q = match arkimedb_query::compile_es_query(&query_json, c) { Ok(v) => v, Err(e) => return internal(e) };
-        let _reidx = c.reindex_lock.read();
         let bm = match q.eval(c) { Ok(v) => v, Err(e) => return internal(e) };
-        drop(_reidx);
         total += bm.len();
         for row_id in bm.iter() {
             match c.doc_id_of(row_id) {
@@ -1270,9 +1266,7 @@ async fn update_by_query(
     let mut total = 0u64;
     for c in &cols {
         let q = match arkimedb_query::compile_es_query(&query_json, c) { Ok(v) => v, Err(e) => return internal(e) };
-        let _reidx = c.reindex_lock.read();
         let bm = match q.eval(c) { Ok(v) => v, Err(e) => return internal(e) };
-        drop(_reidx);
         total += bm.len();
     }
 
