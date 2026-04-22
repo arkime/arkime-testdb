@@ -30,8 +30,11 @@ impl PostingsIndex {
             let mut ex = self.exists.write();
             ex.entry(field.to_string()).or_default().insert(row_id);
         }
-        let mut map = self.map.write();
+        // LOCK ORDER: acquire `per_field` before `map`, matching
+        // `for_each_value` (reader). A reverse order here would create an
+        // AB-BA deadlock with concurrent readers.
         let mut pf = self.per_field.write();
+        let mut map = self.map.write();
         let pf_entry = pf.entry(field.to_string()).or_default();
         for s in values {
             let k = codec::encode_key(field, s);
