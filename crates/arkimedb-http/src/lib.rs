@@ -259,6 +259,19 @@ async fn log_requests(req: Request<axum::body::Body>, next: Next) -> Response {
 
 // -------- root / meta ----------------------------------------------------
 
+/// Run a synchronous, potentially blocking closure on tokio's blocking pool.
+/// This prevents long-running work (searches, bulk writes, redb transactions)
+/// from occupying the tokio runtime's worker threads and starving other
+/// requests — which manifests as the server appearing "stalled" when many
+/// concurrent clients send heavy requests.
+async fn blocking<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.expect("blocking task panicked")
+}
+
 async fn root(State(s): State<Arc<AppState>>) -> Response {
     let body = Json(json!({
         "name": "arkimedb",
@@ -831,7 +844,8 @@ struct WriteQ { op_type: Option<String> }
 async fn index_doc_auto_id(Path(idx): Path<String>, State(s): State<Arc<AppState>>, Query(_q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: None, source: body } };
-    match s.engine.bulk_write(Some(&idx), vec![op]) {
+    let engine = s.engine.clone();
+    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
@@ -844,7 +858,8 @@ async fn index_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<
         BulkKind::Index { id: Some(id), source: body }
     };
     let op = BulkOp { collection: Some(idx.clone()), kind };
-    match s.engine.bulk_write(Some(&idx), vec![op]) {
+    let engine = s.engine.clone();
+    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
@@ -852,7 +867,8 @@ async fn index_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<
 async fn create_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Create { id, source: body } };
-    match s.engine.bulk_write(Some(&idx), vec![op]) {
+    let engine = s.engine.clone();
+    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
@@ -875,7 +891,9 @@ async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc
     // Try a partial update first when we have a doc body.
     if let Some(d) = doc.clone() {
         let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Update { id: id.clone(), doc: d } };
-        match s.engine.bulk_write(Some(&idx), vec![op]) {
+        let engine = s.engine.clone();
+        let idx_c = idx.clone();
+        match blocking(move || engine.bulk_write(Some(&idx_c), vec![op])).await {
             Ok(mut v) => {
                 let o = v.pop().unwrap();
                 if o.ok.is_some() { return outcome_to_response(o); }
@@ -893,14 +911,16 @@ async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc
         return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}"));
     };
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: Some(id), source: src } };
-    match s.engine.bulk_write(Some(&idx), vec![op]) {
+    let engine = s.engine.clone();
+    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
 }
 async fn delete_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>) -> Response {
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Delete { id } };
-    match s.engine.bulk_write(Some(&idx), vec![op]) {
+    let engine = s.engine.clone();
+    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
@@ -1157,11 +1177,18 @@ async fn count_cols(cols: Vec<std::sync::Arc<arkimedb_storage::Collection>>, bod
             total += n;
         }
     } else {
-        for c in &cols {
-            let q = match arkimedb_query::compile_es_query(&query_json, c) { Ok(v) => v, Err(e) => return internal(e) };
-            let bm = match q.eval(c) { Ok(v) => v, Err(e) => return internal(e) };
-            total += bm.len();
-        }
+        let cols_c = cols.clone();
+        let qj = query_json.clone();
+        let r: std::result::Result<u64, arkimedb_core::Error> = blocking(move || {
+            let mut t = 0u64;
+            for c in &cols_c {
+                let q = arkimedb_query::compile_es_query(&qj, c)?;
+                let bm = q.eval(c)?;
+                t += bm.len();
+            }
+            Ok(t)
+        }).await;
+        match r { Ok(t) => total = t, Err(e) => return internal(e) }
     }
     Json(json!({ "count": total, "_shards": { "total": cols.len(), "successful": cols.len(), "failed": 0 } })).into_response()
 }
@@ -1482,7 +1509,9 @@ async fn search_impl(
     if let Some(fr) = q.from { req.from = fr; }
 
     let no_indices = cols.is_empty();
-    let resp = match run_search(&cols, &req) {
+    let cols_for_search = cols.clone();
+    let req_for_search = req.clone();
+    let resp = match blocking(move || run_search(&cols_for_search, &req_for_search)).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[http] _search {} 500: {}\n[http]   body: {}",
