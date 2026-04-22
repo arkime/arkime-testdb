@@ -9,6 +9,7 @@ use arkimedb_core::{Error, Result, Scalar, FieldType};
 use arkimedb_storage::Collection;
 
 use crate::predicate::{compile_es_query, cmp_scalar};
+use crate::search::build_sort_cache;
 
 #[derive(Debug, Clone)]
 pub enum AggKind {
@@ -407,6 +408,15 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
             Ok(AggResult::TermsBuckets { buckets, sum_other_doc_count: total.saturating_sub(kept) })
         }
         AggKind::Histogram { field, interval } => {
+            // Fast path: if all sub-aggs are metric (sum/min/max/avg/value_count)
+            // and the histogram field + sub-agg fields are indexable, avoid
+            // the quadratic "for each bucket, for each metric, iterate all
+            // unique values" scan. Instead build row->Scalar maps once per
+            // field (cached on Collection via sort_cache) and do a single
+            // pass over the matching rows.
+            if let Some(fast) = try_histogram_metric_fast(sets, field, *interval, &spec.subs)? {
+                return Ok(fast);
+            }
             let mut acc: AHashMap<i64, u64> = AHashMap::new();
             // Per-bucket row bitmaps, scoped to each collection, so sub-aggs
             // get the right restriction in multi-index queries.
@@ -609,3 +619,98 @@ fn iso_ms(ms: i64) -> String {
 // Suppress unused warnings while we stabilize.
 #[allow(dead_code)]
 fn _touch(_s: &Scalar) { let _ = cmp_scalar(&Scalar::Null, &Scalar::Null); let _ = FieldType::Keyword; }
+
+/// Fast path for `histogram` with only metric sub-aggs (sum/min/max/avg/
+/// value_count). Builds row->Scalar maps per field using the collection
+/// sort_cache (which is invalidated on writes), then does a single pass
+/// over the matching rows. Turns a quadratic (buckets x metrics x unique
+/// values) scan into a linear one.
+///
+/// Returns `Ok(None)` if this specializer can't handle the request; the
+/// caller falls back to the generic path.
+fn try_histogram_metric_fast(
+    sets: &[(Arc<Collection>, roaring::RoaringBitmap)],
+    hist_field: &str,
+    interval: f64,
+    subs: &[AggRequest],
+) -> Result<Option<AggResult>> {
+    if !(interval > 0.0) { return Ok(None); }
+    // All subs must be simple metric without their own sub-aggs.
+    #[derive(Clone, Copy)]
+    enum MetricKind { Sum, Min, Max, Avg, Count }
+    let mut sub_plans: Vec<(String, MetricKind, String)> = Vec::with_capacity(subs.len());
+    for s in subs {
+        if !s.subs.is_empty() { return Ok(None); }
+        let (k, f) = match &s.kind {
+            AggKind::Sum { field }        => (MetricKind::Sum,   field.clone()),
+            AggKind::Min { field }        => (MetricKind::Min,   field.clone()),
+            AggKind::Max { field }        => (MetricKind::Max,   field.clone()),
+            AggKind::Avg { field }        => (MetricKind::Avg,   field.clone()),
+            AggKind::ValueCount { field } => (MetricKind::Count, field.clone()),
+            _ => return Ok(None),
+        };
+        sub_plans.push((s.name.clone(), k, f));
+    }
+
+    let iv = interval as i64;
+    if iv <= 0 { return Ok(None); }
+
+    // Per-bucket accumulators.
+    let mut doc_count: AHashMap<i64, u64> = AHashMap::new();
+    // (name_idx) -> bucket -> (sum, n, min, max)
+    let mut sub_acc: Vec<AHashMap<i64, (f64, u64, f64, f64)>> =
+        sub_plans.iter().map(|_| AHashMap::new()).collect();
+
+    for (col, bm) in sets {
+        if bm.is_empty() { continue; }
+        // Need histogram field indexed so we can get row->Scalar.
+        if col.index.field_type(hist_field).is_none() { return Ok(None); }
+        for (_, _, f) in &sub_plans {
+            if col.index.field_type(f).is_none() { return Ok(None); }
+        }
+        let (hist_map, _, _) = build_sort_cache(col, hist_field);
+        let sub_maps: Vec<_> = sub_plans.iter()
+            .map(|(_, _, f)| build_sort_cache(col, f).0)
+            .collect();
+
+        for r in bm.iter() {
+            let Some(hv) = hist_map.get(&r).and_then(scalar_to_f64) else { continue; };
+            let key = ((hv / interval).floor() as i64).saturating_mul(iv);
+            *doc_count.entry(key).or_default() += 1;
+            for (i, sub_map) in sub_maps.iter().enumerate() {
+                let Some(sv) = sub_map.get(&r).and_then(scalar_to_f64) else { continue; };
+                let e = sub_acc[i].entry(key).or_insert((0.0, 0, f64::INFINITY, f64::NEG_INFINITY));
+                e.0 += sv;
+                e.1 += 1;
+                if sv < e.2 { e.2 = sv; }
+                if sv > e.3 { e.3 = sv; }
+            }
+        }
+    }
+
+    let mut keys: Vec<i64> = doc_count.keys().copied().collect();
+    keys.sort();
+    let mut buckets = Vec::with_capacity(keys.len());
+    for k in keys {
+        let count = doc_count[&k];
+        let mut subs_out: AHashMap<String, AggResult> = AHashMap::new();
+        for (i, (name, kind, _)) in sub_plans.iter().enumerate() {
+            let v = sub_acc[i].get(&k).copied();
+            let result = match kind {
+                MetricKind::Sum => AggResult::Metric(Some(v.map(|(s,_,_,_)| s).unwrap_or(0.0))),
+                MetricKind::Min => AggResult::Metric(v.and_then(|(_,n,mn,_)| if n == 0 { None } else { Some(mn) })),
+                MetricKind::Max => AggResult::Metric(v.and_then(|(_,n,_,mx)| if n == 0 { None } else { Some(mx) })),
+                MetricKind::Avg => AggResult::Metric(v.and_then(|(s,n,_,_)| if n == 0 { None } else { Some(s / n as f64) })),
+                MetricKind::Count => AggResult::Long(v.map(|(_,n,_,_)| n).unwrap_or(0)),
+            };
+            subs_out.insert(name.clone(), result);
+        }
+        buckets.push(Bucket {
+            key: serde_json::json!(k),
+            key_as_string: None,
+            doc_count: count,
+            subs: subs_out,
+        });
+    }
+    Ok(Some(AggResult::Buckets(buckets)))
+}

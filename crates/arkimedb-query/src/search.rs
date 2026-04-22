@@ -347,7 +347,7 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
 /// Build (or fetch from cache) the row->Scalar map and (min, max) range
 /// for `field` on `col`. The per-collection sort_cache/sort_range are
 /// cleared on any write to the collection.
-fn build_sort_cache(col: &Arc<Collection>, field: &str)
+pub fn build_sort_cache(col: &Arc<Collection>, field: &str)
     -> (Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>, arkimedb_core::Scalar, arkimedb_core::Scalar)
 {
     if let Some(m) = col.sort_cache.read().get(field) {
