@@ -718,3 +718,253 @@ What Arkime **does** need:
 
 ---
 
+## 18. Concurrency under load (tokio + shared locks)
+
+These bugs didn't appear until the viewer fanned out concurrent
+searches while a bulk ingest was in-flight. Single-request benchmarks
+were always green. Some were textbook, some were subtle.
+
+### 18.1 Axum handlers must not run sync work directly
+
+axum spawns each request on a tokio worker. Any synchronous work —
+redb transactions, roaring-bitmap scans, JSON (de)ser for a 50-hit
+response — **blocks that worker thread** for the whole duration. With
+the default ~N-core worker pool, `N` concurrent searches park every
+worker and the accept loop stops making progress. Symptom: `curl /`
+hangs, but a fresh TCP connection still accepts at the kernel level
+(somaxconn queue), so `ss`/`lsof` shows lots of ESTABLISHED
+connections and `sample` shows all workers in `park`.
+
+Fix: wrap every sync hot path in `tokio::task::spawn_blocking`. A
+one-line helper (`blocking(move || …)`) keeps call sites small:
+
+```rust
+async fn blocking<F, T>(f: F) -> Result<T>
+  where F: FnOnce() -> Result<T> + Send + 'static, T: Send + 'static
+{ tokio::task::spawn_blocking(f).await.unwrap() }
+```
+
+Wrap at minimum: `_search` (compile + eval + hydrate), `_count` on
+non-match_all, `_bulk`, every CRUD handler, agg execution. Leave
+`GET /`, `_cluster/health`, `_cat/*` alone — those are cheap.
+
+### 18.2 Shared index structures need a declared lock order
+
+`PostingsIndex` has a top-level `map: RwLock<…>` and per-field
+`RwLock<…>` inside each value. Insert acquired `map.write()` then
+`per_field.write()`; `for_each_value` acquired `per_field.read()`
+then `map.read()`. Under concurrent search + ingest (after §18.3
+removed the coarse serializer), this is a classic AB-BA deadlock —
+both threads hold one lock and wait for the other. Tokio workers
+park forever, process survives, `GET /` still answers because `/` is
+cheap and a different worker handles it.
+
+Rule: pick a single direction and document it at the top of the
+file. We chose **per_field before map, and always only the structure
+you're about to mutate**. Add a `// LOCK ORDER: per_field → map`
+comment directly above each acquisition.
+
+### 18.3 Don't serialize reads behind a bulk `reindex_lock`
+
+Early on, every read path took `collection.reindex_lock.read()` to
+exclude bulk writes. This works for correctness but turns the server
+single-reader-while-writing: a long bulk starves every search. ES
+itself allows reads to observe pre-refresh state; it never blocks
+reads behind writes.
+
+Fix: drop the read-side of `reindex_lock` everywhere. Accept that a
+search may observe a half-applied bulk (some postings updated, some
+not) — that's the same semantic ES gives before `refresh`. The
+per-structure RwLocks inside `PostingsIndex` still protect internal
+consistency; §18.2 just has to be right.
+
+Keep `reindex_lock.write()` in bulk itself, sorted by Arc pointer
+across the collections a bulk touches, to prevent bulk-bulk deadlock.
+
+### 18.4 Per-doc update lock for the tagging race
+
+Arkime's tagging issues `_update` with `doc:{...}` on the same session
+concurrently from multiple workers. Read-modify-write races produced
+"last writer wins" losses — tags dropped, not duplicated.
+
+Fix: a `DashMap<String, Arc<Mutex<()>>>` keyed by `(index, id)` held
+for the full read-merge-write of a single doc. No global lock, no
+interference across docs. Combined with §18.3 this is the right
+granularity: per-doc atomicity, no per-collection stop-the-world.
+
+### 18.5 Cache invalidation scope = per collection, not global
+
+`sort_cache` (row→Scalar map for sort/agg fast paths, §19) lives on
+`Collection`. Writes to collection A should invalidate A's cache,
+never B's. Arkime search fans out across 300+ daily session
+collections; a single `_update` invalidating them all turned the
+"warm" timeline queries back into "cold" ones.
+
+Rule: keep caches on the smallest object that owns the underlying
+data. Clear them in the same write path that touches that data.
+
+### 18.6 `DELETE /:idx` must actually remove the file
+
+An early version marked the collection deleted in the catalog, freed
+the in-memory handles, and left the `.redb` file on disk. Next
+startup re-opened it and the index reappeared. Arkime's rotation
+tests (`db.pl expire`) silently fell back to "index still here."
+
+Always close the redb handle, `fs::remove_file` the data file, and
+only then drop the catalog entry. Test by restarting — if the index
+comes back, you forgot the unlink.
+
+---
+
+## 19. Query-shape fast paths
+
+Two Arkime query shapes dominate wall time; both benefit from the
+same trick — a per-collection **row→Scalar cache** (invalidated on
+write) consulted instead of walking postings.
+
+### 19.1 Sort by an indexed field + small `size` — extremum-first
+
+Arkime's `/api/sessions` issues `sort:[{firstPacket:asc}] size:50`
+across every daily sessions index. Naive: materialize all hits,
+stable-sort, truncate. That's O(N log N) with N = millions.
+
+Fast path:
+
+1. Per collection, cache `(min, max)` of the sort field
+   (`sort_range`), computed once.
+2. At query time, partition collections into "indexed on this field"
+   vs "unindexed" (the sort field is `_missing` for them).
+3. Process indexed collections in extremum order (smallest-`min`
+   first for asc, largest-`max` first for desc). For each, consult
+   `sort_cache[field]` (row_id → Scalar), push into a bounded heap
+   sized to `from + size`.
+4. Early-stop: once the heap is full and the next collection's
+   extremum is worse than the heap's worst, skip every remaining
+   collection. One posting list per collection, then done.
+5. For `missing:_last` with sorted-asc: unindexed collections
+   contribute `_missing` rows — only materialize them if they'd
+   land in the page. Same for `missing:_first` at the front.
+
+Measured: 60k-hit firstPacket sort **5s → ~15ms**.
+
+The `sort_cache` must:
+* Be an `Arc<AHashMap<RowId, Scalar>>` so reads are lock-free once
+  obtained.
+* Be keyed by field name (most collections need only 1–2 fields).
+* Be cleared on every write to the collection it lives on (§18.5).
+
+### 19.2 Histogram with metric sub-aggs — reuse the same cache
+
+Arkime's annotation query:
+
+```json
+{"histogram":{"field":"lastPacket","interval":3600000,"min_doc_count":1},
+ "aggs":{"source.packets":{"sum":{"field":"source.packets"}},
+         "destination.packets":{"sum":...}, /* 6 total */ }}
+```
+
+Generic path: for each bucket, for each sub-agg, iterate every
+unique value of the field and do `(value_bm & bucket_bm).len()`.
+Cost ≈ `buckets × subs × unique_values_of_field`. With 24 buckets,
+6 subs, thousands of unique byte-counts per collection, ~8M bitmap
+ANDs. **48 seconds.**
+
+Fast path — activate when ALL sub-aggs are metric (sum/min/max/avg/
+value_count) and the histogram and sub-agg fields are indexed:
+
+1. Build `sort_cache` for the histogram field and each metric
+   field (reuses §19.1 infra, shared invalidation).
+2. Single pass over the matching-rows bitmap:
+   ```
+   for r in bm.iter() {
+     let key = floor(hist_map[r] / iv) * iv;
+     doc_count[key] += 1;
+     for (i, sub_map) in sub_maps.iter().enumerate() {
+       let v = sub_map[r]; // skip if missing
+       acc[i][key] += (v, 1, min(v), max(v));
+     }
+   }
+   ```
+3. Emit buckets in key-sorted order.
+
+Turns quadratic into linear. Measured: **48s → ~1.1s cold,
+~350ms warm**.
+
+Fall back to the generic path for any non-metric sub-agg, missing
+index, or zero interval. Same structure works for `date_histogram`;
+just store ms keys directly.
+
+### 19.3 Min/max-pruning across collections
+
+For date-typed sort fields across many collections, a further
+optimisation: cache `(min, max)` per (collection, field). Process
+the best-first collection, fill the top-K heap, then for every
+remaining collection compare its cached extremum to the heap's
+worst — if the collection **can't** contribute a value better than
+what's already in the heap, skip it entirely (no posting walk, no
+hydration). For cold caches the gain is modest; once extrema are
+warm (they live in memory and almost never invalidate) multi-index
+sorts become effectively single-index.
+
+---
+
+## 20. Operational & release lessons
+
+### 20.1 Releases need a workflow dispatch, not just a tag
+
+Pushing `v0.1.X` to the repo's default-branch tag list does **not**
+publish a GitHub Release that produces the
+`/releases/latest/download/arkimedb-linux-${arch}` assets Arkime
+downloads. The `release.yml` workflow triggers on `workflow_dispatch`,
+so after tagging run:
+
+```
+git tag vX.Y.Z && git push origin vX.Y.Z
+gh workflow run release.yml --ref vX.Y.Z -R <owner>/<repo>
+```
+
+Skip step 2 and the tag is there but no binary — Arkime CI silently
+reuses the last released version.
+
+### 20.2 `addUser.js` cache bug = cache a negative result, forget to invalidate
+
+Symptom: `addUser.js -n testuser admin admin admin --createOnly`
+reported "user already exists" while
+`GET /tests_users/_doc/admin` returned 404. Root cause: an
+in-process "known user ids" cache populated at startup was never
+invalidated on delete, so the second invocation in a test loop saw
+a stale positive. Arkime's own user caches work the same way — if
+you add any per-process cache over a redb table, wire a
+**write-path invalidator** for it at the same moment you write the
+table, not at some later "refresh."
+
+### 20.3 `arkimedb_version` in `GET /`
+
+Arkime's own `version.number` on `/` is pinned to `7.10.10` for
+compatibility, which makes "what am I actually running?" hard to
+answer in the field. Emit an extra `arkimedb_version:
+env!("CARGO_PKG_VERSION")` alongside the ES version block. Costs
+nothing, doesn't trip any ES client, invaluable during rolling
+upgrades.
+
+### 20.4 Stale-postings bugs have a recognisable shape
+
+If you find yourself debugging "a deleted/retagged thing still
+matches a search," the answer is almost always **postings updated,
+row not removed from old value's bitmap first**. §15 tombstones
+aside — if your reindex path only inserts, you will hit this. The
+cheapest workaround is ANDing every read bitmap with the
+"live rows" bitmap; the correct fix is `remove_row` before every
+index of an existing doc.
+
+### 20.5 redb file-count is the disk floor
+
+redb's 1.5MB minimum file × 346 empty daily collections = most of
+the on-disk size for a tests_* dataset. If disk is the #1 priority
+(it is for us), plan the schema around **one redb per "family"**
+with a table per day, not a redb per day. Retrofitting this is
+painful; doing it early isn't. We chose "monthly sessions in one
+redb" as a compromise (§checkpoint 025).
+
+---
+

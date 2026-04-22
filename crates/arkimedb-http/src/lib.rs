@@ -1139,10 +1139,18 @@ async fn do_mget(s: &Arc<AppState>, default_idx: Option<String>, body: String) -
 // -------- refresh / count / search --------------------------------------
 
 async fn refresh_all(State(s): State<Arc<AppState>>) -> Response {
-    handle(s.engine.refresh(None).map(|_| json!({ "_shards": { "total": 1, "successful": 1, "failed": 0 } })))
+    let engine = s.engine.clone();
+    match blocking(move || engine.refresh(None)).await {
+        Ok(_) => Json(json!({ "_shards": { "total": 1, "successful": 1, "failed": 0 } })).into_response(),
+        Err(e) => internal(e),
+    }
 }
 async fn refresh_one(Path(idx): Path<String>, State(s): State<Arc<AppState>>) -> Response {
-    handle(s.engine.refresh(Some(&idx)).map(|_| json!({ "_shards": { "total": 1, "successful": 1, "failed": 0 } })))
+    let engine = s.engine.clone();
+    match blocking(move || engine.refresh(Some(&idx))).await {
+        Ok(_) => Json(json!({ "_shards": { "total": 1, "successful": 1, "failed": 0 } })).into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 #[derive(Deserialize, Default)]

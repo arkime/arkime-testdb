@@ -550,7 +550,33 @@ impl Engine {
     /// re-inserted every in-memory tombstone — an O(collections * tombs)
     /// round trip that added tens of seconds to the Arkime test suite
     /// even though the data was already persisted by `delete_doc_in_tx`.
-    pub fn refresh(&self, _target: Option<&str>) -> Result<()> {
+    pub fn refresh(&self, target: Option<&str>) -> Result<()> {
+        // Our writes are queryable immediately on commit, so there's no
+        // Lucene-style "buffered-but-not-yet-searchable" state to flush.
+        // What clients (Arkime) need is a **barrier**: after `_refresh`
+        // returns, every write that completed before the refresh call
+        // must be visible. Briefly acquiring (and immediately releasing)
+        // `reindex_lock.write()` on every matching collection waits for
+        // any concurrent bulk holding the lock across commit+postings
+        // update to finish, then lets readers see fully-applied state.
+        let cols: Vec<Arc<Collection>> = match target {
+            Some(t) => self.resolve(t).unwrap_or_default(),
+            None => {
+                let g = self.collections.read();
+                g.values().cloned().collect()
+            }
+        };
+        // Sort by Arc pointer to share lock order with bulk_write_one_db
+        // so a concurrent bulk can never AB-BA-deadlock with a refresh.
+        let mut uniq: Vec<Arc<Collection>> = Vec::with_capacity(cols.len());
+        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::new();
+        for c in cols {
+            if seen.insert(Arc::as_ptr(&c) as usize) { uniq.push(c); }
+        }
+        uniq.sort_by_key(|c| Arc::as_ptr(c) as usize);
+        for c in uniq {
+            let _g = c.reindex_lock.write();
+        }
         Ok(())
     }
 
