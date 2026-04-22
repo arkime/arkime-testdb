@@ -839,13 +839,23 @@ fn schema_to_mapping(sch: &arkimedb_core::CollectionSchema) -> J {
 // -------- document CRUD --------------------------------------------------
 
 #[derive(Deserialize, Default)]
-struct WriteQ { op_type: Option<String> }
+struct WriteQ { op_type: Option<String>, refresh: Option<String> }
 
-async fn index_doc_auto_id(Path(idx): Path<String>, State(s): State<Arc<AppState>>, Query(_q): Query<WriteQ>, Json(body): Json<J>) -> Response {
+fn is_refresh_true(v: &Option<String>) -> bool {
+    matches!(v.as_deref(), Some("true") | Some("wait_for") | Some("1") | Some(""))
+}
+
+async fn index_doc_auto_id(Path(idx): Path<String>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: None, source: body } };
     let engine = s.engine.clone();
-    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
+    let refresh = is_refresh_true(&q.refresh);
+    let idx_c = idx.clone();
+    match blocking(move || {
+        let r = engine.bulk_write(Some(&idx_c), vec![op]);
+        if refresh { let _ = engine.refresh(Some(&idx_c)); }
+        r
+    }).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
@@ -859,21 +869,33 @@ async fn index_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<
     };
     let op = BulkOp { collection: Some(idx.clone()), kind };
     let engine = s.engine.clone();
-    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
+    let refresh = is_refresh_true(&q.refresh);
+    let idx_c = idx.clone();
+    match blocking(move || {
+        let r = engine.bulk_write(Some(&idx_c), vec![op]);
+        if refresh { let _ = engine.refresh(Some(&idx_c)); }
+        r
+    }).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
 }
-async fn create_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Json(body): Json<J>) -> Response {
+async fn create_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Create { id, source: body } };
     let engine = s.engine.clone();
-    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
+    let refresh = is_refresh_true(&q.refresh);
+    let idx_c = idx.clone();
+    match blocking(move || {
+        let r = engine.bulk_write(Some(&idx_c), vec![op]);
+        if refresh { let _ = engine.refresh(Some(&idx_c)); }
+        r
+    }).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
 }
-async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Json(body): Json<J>) -> Response {
+async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
     // Script path: interpret known Arkime painless scripts (tags, hunt).
     if let Some(script) = body.get("script") {
@@ -893,7 +915,12 @@ async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc
         let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Update { id: id.clone(), doc: d } };
         let engine = s.engine.clone();
         let idx_c = idx.clone();
-        match blocking(move || engine.bulk_write(Some(&idx_c), vec![op])).await {
+        let refresh = is_refresh_true(&q.refresh);
+        match blocking(move || {
+            let r = engine.bulk_write(Some(&idx_c), vec![op]);
+            if refresh { let _ = engine.refresh(Some(&idx_c)); }
+            r
+        }).await {
             Ok(mut v) => {
                 let o = v.pop().unwrap();
                 if o.ok.is_some() { return outcome_to_response(o); }
@@ -912,15 +939,27 @@ async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc
     };
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: Some(id), source: src } };
     let engine = s.engine.clone();
-    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
+    let refresh = is_refresh_true(&q.refresh);
+    let idx_c = idx.clone();
+    match blocking(move || {
+        let r = engine.bulk_write(Some(&idx_c), vec![op]);
+        if refresh { let _ = engine.refresh(Some(&idx_c)); }
+        r
+    }).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }
 }
-async fn delete_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>) -> Response {
+async fn delete_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>) -> Response {
     let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Delete { id } };
     let engine = s.engine.clone();
-    match blocking(move || engine.bulk_write(Some(&idx), vec![op])).await {
+    let refresh = is_refresh_true(&q.refresh);
+    let idx_c = idx.clone();
+    match blocking(move || {
+        let r = engine.bulk_write(Some(&idx_c), vec![op]);
+        if refresh { let _ = engine.refresh(Some(&idx_c)); }
+        r
+    }).await {
         Ok(mut v) => outcome_to_response(v.pop().unwrap()),
         Err(e) => internal(e),
     }

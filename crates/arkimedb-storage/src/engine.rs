@@ -946,7 +946,10 @@ fn write_many_in_one_tx(
             Err(e) => results[pi] = Err(e),
             Ok((_, id, row_id, created, version)) => {
                 col.tombstones.write().remove(row_id);
-                if !created { col.index.remove_row(row_id); }
+                // Always clear stale postings before re-indexing (handles
+                // tombstoned-row resurrection where created=true but old
+                // postings remain).
+                col.index.remove_row(row_id);
                 {
                     let mut schema = col.schema.write();
                     let src = &preps[pi].as_ref().unwrap().source;
@@ -1222,8 +1225,14 @@ fn bulk_write_one_db(
                     }
                     BulkKind::Index { .. } | BulkKind::Create { .. } => {
                         col.tombstones.write().remove(tr.row_id);
-                        // reindex_lock already held at the outer scope.
-                        if !tr.created { col.index.remove_row(tr.row_id); }
+                        // Always clear stale postings for this row before
+                        // re-indexing. Covers three cases:
+                        //   - overwrite of an existing live doc,
+                        //   - resurrection of a tombstoned row (same id,
+                        //     previously deleted; tr.created=true but old
+                        //     postings still point at this row_id),
+                        //   - truly new row (no-op on an empty row).
+                        col.index.remove_row(tr.row_id);
                         let src = &it.prep.as_ref().unwrap().source;
                         {
                             let mut schema = col.schema.write();
