@@ -197,7 +197,9 @@ pub fn run_aggs(cols: &[Arc<Collection>], query_json: &J, specs: &[AggRequest]) 
     let mut sets: Vec<(Arc<Collection>, roaring::RoaringBitmap)> = Vec::with_capacity(cols.len());
     for col in cols {
         let q = compile_es_query(query_json, col)?;
+        let _reidx = col.reindex_lock.read();
         let bm = q.eval(col)?;
+        drop(_reidx);
         sets.push((col.clone(), bm));
     }
     let mut out = AHashMap::new();

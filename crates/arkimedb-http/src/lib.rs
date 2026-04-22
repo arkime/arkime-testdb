@@ -900,7 +900,8 @@ async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J)
         return internal(e);
     }
     let op = BulkOp { collection: Some(col.name.clone()), kind: BulkKind::Index { id: Some(id.to_string()), source: cur } };
-    match s.engine.bulk_write(Some(&col.name), vec![op]) {
+    let res = s.engine.bulk_write(Some(&col.name), vec![op]);
+    match res {
         Ok(mut v) => {
             let mut o = v.pop().unwrap();
             if let Some(ref mut r) = o.ok { r.action = "update"; }
@@ -1059,7 +1060,9 @@ async fn count_cols(cols: Vec<std::sync::Arc<arkimedb_storage::Collection>>, bod
     } else {
         for c in &cols {
             let q = match arkimedb_query::compile_es_query(&query_json, c) { Ok(v) => v, Err(e) => return internal(e) };
+            let _reidx = c.reindex_lock.read();
             let bm = match q.eval(c) { Ok(v) => v, Err(e) => return internal(e) };
+            drop(_reidx);
             total += bm.len();
         }
     }
@@ -1093,7 +1096,9 @@ async fn delete_by_query(
 
     for c in &cols {
         let q = match arkimedb_query::compile_es_query(&query_json, c) { Ok(v) => v, Err(e) => return internal(e) };
+        let _reidx = c.reindex_lock.read();
         let bm = match q.eval(c) { Ok(v) => v, Err(e) => return internal(e) };
+        drop(_reidx);
         total += bm.len();
         for row_id in bm.iter() {
             match c.doc_id_of(row_id) {
@@ -1166,7 +1171,9 @@ async fn update_by_query(
     let mut total = 0u64;
     for c in &cols {
         let q = match arkimedb_query::compile_es_query(&query_json, c) { Ok(v) => v, Err(e) => return internal(e) };
+        let _reidx = c.reindex_lock.read();
         let bm = match q.eval(c) { Ok(v) => v, Err(e) => return internal(e) };
+        drop(_reidx);
         total += bm.len();
     }
 

@@ -69,6 +69,11 @@ pub struct Collection {
     pub schema: RwLock<CollectionSchema>,
     /// Tombstoned row ids (not yet GC'd). Also stored in `TOMBSTONES`.
     pub tombstones: RwLock<RoaringBitmap>,
+    /// Guards the non-atomic (remove_row + index_one) reindex sequence on
+    /// updates. Held exclusively during post-commit reindex; searches take
+    /// a read guard so they never observe a row temporarily missing from
+    /// postings mid-reindex.
+    pub reindex_lock: RwLock<()>,
     pub(crate) storage_cfg: StorageConfig,
     /// True if this collection's Database is shared with other
     /// collections (sessions-family). Writes to shared-DB collections
@@ -687,6 +692,7 @@ fn open_collection(
         index: Arc::new(PostingsIndex::new()),
         schema: RwLock::new(schema),
         tombstones: RwLock::new(RoaringBitmap::new()),
+        reindex_lock: RwLock::new(()),
         storage_cfg,
         shared_db: shared,
         tables,
@@ -1024,6 +1030,33 @@ fn bulk_write_one_db(
 
     // Single write tx for the whole DB.
     let mut out: Vec<(usize, BulkOutcome)> = Vec::with_capacity(items.len());
+
+    // Acquire reindex_lock.write() on every touched collection BEFORE we
+    // commit. Holding it across both the commit and the post-commit in-memory
+    // index updates closes the "visible on disk but stale in memory" gap —
+    // without this, a reader that enters between commit() and the per-col
+    // reindex_lock.write() sees a bitmap that still claims the old row
+    // membership (e.g. still tagged MTAGTEST1) even though the doc on disk
+    // has been updated. Order by collection-Arc pointer to get a deterministic
+    // lock order across threads, avoiding any deadlock if two bulks touch the
+    // same collections.
+    let mut reindex_guards: Vec<parking_lot::RwLockWriteGuard<()>> = {
+        let mut uniq: Vec<Arc<Collection>> = Vec::with_capacity(cols.len());
+        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::new();
+        for (c, _, _) in cols {
+            if seen.insert(Arc::as_ptr(c) as usize) { uniq.push(c.clone()); }
+        }
+        uniq.sort_by_key(|c| Arc::as_ptr(c) as usize);
+        uniq.into_iter().map(|c| {
+            // SAFETY: the guard's lifetime is tied to the Collection which we
+            // keep alive via the clones in `cols`. We leak the Arc into the
+            // guard's lifetime by using a raw borrow — acceptable because the
+            // guard is dropped before this function returns.
+            let g: parking_lot::RwLockWriteGuard<'_, ()> = c.reindex_lock.write();
+            unsafe { std::mem::transmute::<parking_lot::RwLockWriteGuard<'_, ()>, parking_lot::RwLockWriteGuard<'static, ()>>(g) }
+        }).collect()
+    };
+
     let mut w = match db.begin_write() {
         Ok(w) => w,
         Err(e) => {
@@ -1032,6 +1065,7 @@ fn bulk_write_one_db(
                 let cname = &cols[it.col_i].2;
                 out.push((it.orig, BulkOutcome::err(cname, Error::Io(std::io::Error::other(e.to_string())))));
             }
+            reindex_guards.clear();
             return out;
         }
     };
@@ -1104,6 +1138,7 @@ fn bulk_write_one_db(
             let cname = &cols[it.col_i].2;
             out.push((it.orig, BulkOutcome::err(cname, Error::Io(std::io::Error::other(e.to_string())))));
         }
+        reindex_guards.clear();
         return out;
     }
 
@@ -1112,7 +1147,9 @@ fn bulk_write_one_db(
         let col = &cols[it.col_i].0;
         let cname = &cols[it.col_i].2;
         match r {
-            Err(e) => out.push((it.orig, BulkOutcome::err(cname, e))),
+            Err(e) => {
+                out.push((it.orig, BulkOutcome::err(cname, e)))
+            },
             Ok(tr) => {
                 match &it.kind {
                     BulkKind::Delete { .. } => {
@@ -1121,6 +1158,7 @@ fn bulk_write_one_db(
                     }
                     BulkKind::Index { .. } | BulkKind::Create { .. } => {
                         col.tombstones.write().remove(tr.row_id);
+                        // reindex_lock already held at the outer scope.
                         if !tr.created { col.index.remove_row(tr.row_id); }
                         let src = &it.prep.as_ref().unwrap().source;
                         {
@@ -1136,6 +1174,7 @@ fn bulk_write_one_db(
                     }
                     BulkKind::Update { .. } => {
                         col.tombstones.write().remove(tr.row_id);
+                        // reindex_lock already held at the outer scope.
                         col.index.remove_row(tr.row_id);
                         // Rebuild postings for the now-current doc: we
                         // wrote `cur` (base + patch) above; re-read it
@@ -1152,6 +1191,10 @@ fn bulk_write_one_db(
             }
         }
     }
+    // Drop reindex guards explicitly *after* all post-commit index work is
+    // done so readers cannot see the committed-on-disk-but-stale-in-memory
+    // state.
+    drop(reindex_guards);
     out
 }
 

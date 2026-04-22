@@ -206,7 +206,9 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
     let mut total: u64 = 0;
     for col in cols {
         let q = compile_es_query(&q_json, col)?;
+        let _reidx = col.reindex_lock.read();
         let bm = q.eval(col)?;
+        drop(_reidx);
         total += bm.len();
         for r in bm.iter() { all_hits.push((col.clone(), r)); }
     }
