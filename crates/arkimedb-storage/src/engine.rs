@@ -785,7 +785,7 @@ fn open_collection(
         storage_cfg,
         shared_db: shared,
         tables,
-        refresh_interval_ms: std::sync::atomic::AtomicU64::new(0),
+        refresh_interval_ms: std::sync::atomic::AtomicU64::new(30_000),
         last_refresh: parking_lot::Mutex::new(std::time::Instant::now()),
         pending_reindex: parking_lot::Mutex::new(ahash::AHashMap::new()),
     })
@@ -1319,15 +1319,11 @@ fn bulk_write_one_db(
                         if should_defer_reindex(col) {
                             // Defer: remember we need to (re)index this row,
                             // preserving whether an earlier postings entry
-                            // exists for it.
+                            // exists for it. Schema merge happens at drain
+                            // time — avoid per-row write-lock contention here.
                             let mut pend = col.pending_reindex.lock();
                             let entry = pend.entry(tr.row_id).or_insert(PendingEntry { need_remove_row: !tr.fresh });
                             entry.need_remove_row |= !tr.fresh;
-                            // Still merge schema so that dynamic mappings
-                            // stay current for future writes. Cheap.
-                            let mut schema = col.schema.write();
-                            fc.merge_from_record(&col.name, src);
-                            if let Some(cs) = fc.get(&col.name) { *schema = cs; }
                         } else {
                             // Apply any previously-deferred items before this one
                             // so the postings reflect insertion order.

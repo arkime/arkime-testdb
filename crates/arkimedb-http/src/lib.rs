@@ -2545,7 +2545,9 @@ async fn get_settings(Path(idx): Path<String>, State(s): State<Arc<AppState>>) -
     let mut out = serde_json::Map::new();
     for c in cols {
         let ri_ms = c.refresh_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let ri_str = if ri_ms == 0 { "1s".to_string() } else { format!("{}ms", ri_ms) };
+        let ri_str = if ri_ms == 0 { "-1".to_string() }
+            else if ri_ms % 1000 == 0 { format!("{}s", ri_ms / 1000) }
+            else { format!("{}ms", ri_ms) };
         out.insert(c.name.clone(), json!({
             "settings": {
                 "index": {
