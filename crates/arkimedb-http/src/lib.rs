@@ -552,6 +552,9 @@ async fn create_index(Path(idx): Path<String>, State(s): State<Arc<AppState>>, b
         if !m.is_null() {
             if let Err(e) = apply_mapping_to_col(&s, &col, &m) { return internal(e); }
         }
+        if let Some(ms) = parse_refresh_interval(&b) {
+            col.refresh_interval_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Json(json!({ "acknowledged": true, "index": idx })).into_response()
 }
@@ -746,8 +749,38 @@ fn apply_matching_templates(s: &Arc<AppState>, idx_name: &str, col: &Arc<arkimed
     for (_order, parsed) in matched {
         // ES `_index_template` puts mappings under {template:{mappings:...}}, legacy under {mappings:...}.
         let body_for_mapping = parsed.get("template").cloned().unwrap_or(parsed);
+        // Pick up `settings.index.refresh_interval` if present.
+        if let Some(ms) = parse_refresh_interval(&body_for_mapping) {
+            col.refresh_interval_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = apply_mapping_to_col(s, col, &body_for_mapping);
     }
+}
+
+/// Parse an ES-style refresh_interval (e.g. "60s", "500ms", "-1") from a
+/// settings body. Accepts both nested ({settings:{index:{refresh_interval}}})
+/// and flat ({settings:{"index.refresh_interval"}}). Returns milliseconds
+/// (0 to disable deferral, matching our "instant refresh" mode).
+fn parse_refresh_interval(body: &J) -> Option<u64> {
+    let settings = body.get("settings")?;
+    // Try nested path first.
+    let v = settings.pointer("/index/refresh_interval")
+        .or_else(|| settings.get("index.refresh_interval"))
+        .or_else(|| body.pointer("/index/refresh_interval"));
+    let s = match v? {
+        J::String(s) => s.clone(),
+        J::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let s = s.trim();
+    if s == "-1" || s.eq_ignore_ascii_case("null") { return Some(0); }
+    // "Xms", "Xs", "Xm", "Xh", or bare number (seconds in ES default).
+    let (num, mul) = if let Some(pre) = s.strip_suffix("ms") { (pre, 1u64) }
+        else if let Some(pre) = s.strip_suffix('s') { (pre, 1_000u64) }
+        else if let Some(pre) = s.strip_suffix('m') { (pre, 60_000u64) }
+        else if let Some(pre) = s.strip_suffix('h') { (pre, 3_600_000u64) }
+        else { (s, 1_000u64) };
+    num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(mul))
 }
 
 fn find_properties(m: &J) -> Option<&serde_json::Map<String, J>> {
@@ -2511,12 +2544,14 @@ async fn get_settings(Path(idx): Path<String>, State(s): State<Arc<AppState>>) -
     if cols.is_empty() { return Json(json!({})).into_response(); }
     let mut out = serde_json::Map::new();
     for c in cols {
+        let ri_ms = c.refresh_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let ri_str = if ri_ms == 0 { "1s".to_string() } else { format!("{}ms", ri_ms) };
         out.insert(c.name.clone(), json!({
             "settings": {
                 "index": {
                     "number_of_shards": "1",
                     "number_of_replicas": "0",
-                    "refresh_interval": "60s",
+                    "refresh_interval": ri_str,
                     "uuid": c.name,
                     "provided_name": c.name,
                     "creation_date": "0",
@@ -2528,11 +2563,15 @@ async fn get_settings(Path(idx): Path<String>, State(s): State<Arc<AppState>>) -
     Json(J::Object(out)).into_response()
 }
 async fn put_settings(Path(idx): Path<String>, State(s): State<Arc<AppState>>, body: Option<Json<J>>) -> Response {
-    let _ = body;
     // Accept comma-separated patterns + wildcards; resolve to existing indices and
     // do NOT create phantom collections from the pattern string.
-    for existing in s.engine.resolve(&idx).unwrap_or_default() {
-        let _ = existing;
+    if let Some(Json(b)) = body {
+        let ri = parse_refresh_interval(&b);
+        for existing in s.engine.resolve(&idx).unwrap_or_default() {
+            if let Some(ms) = ri {
+                existing.refresh_interval_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     Json(json!({ "acknowledged": true })).into_response()
 }

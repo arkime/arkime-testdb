@@ -88,7 +88,32 @@ pub struct Collection {
     /// serialize on the same redb writer mutex.
     pub(crate) shared_db: bool,
     pub(crate) tables: CollTables,
+    /// Refresh interval in milliseconds. 0 = refresh on every write
+    /// (default, matches original behavior). >0 = defer in-memory
+    /// postings updates until this much time passes or the pending
+    /// buffer fills. Matches ES `index.refresh_interval` semantics.
+    pub refresh_interval_ms: std::sync::atomic::AtomicU64,
+    /// Last time pending_reindex was drained.
+    pub last_refresh: parking_lot::Mutex<std::time::Instant>,
+    /// row_ids whose in-memory postings/schema do not yet reflect the
+    /// on-disk state. Drained by refresh() or when the elapsed time
+    /// exceeds refresh_interval_ms or buffer exceeds PENDING_MAX.
+    pub pending_reindex: parking_lot::Mutex<ahash::AHashMap<u32, PendingEntry>>,
 }
+
+/// What's known about a deferred reindex target. `need_remove_row`
+/// flips true if the row existed in postings *before* being deferred
+/// (overwrite / tombstone resurrection / update / script).
+#[derive(Clone, Debug)]
+pub struct PendingEntry {
+    pub need_remove_row: bool,
+}
+
+/// Upper bound on pending reindex entries per collection. Exceeding
+/// this forces an immediate drain regardless of refresh_interval —
+/// bounds memory and keeps search latency predictable if a client
+/// stops hitting `_refresh`.
+pub const PENDING_MAX: usize = 50_000;
 
 impl Collection {
     pub fn row_count(&self) -> Result<u64> {
@@ -576,6 +601,9 @@ impl Engine {
         uniq.sort_by_key(|c| Arc::as_ptr(c) as usize);
         for c in uniq {
             let _g = c.reindex_lock.write();
+            // Apply any postings updates that were deferred while
+            // refresh_interval_ms > 0. No-op when nothing is pending.
+            drain_pending_reindex(&c, &self.field_catalog);
         }
         Ok(())
     }
@@ -757,6 +785,9 @@ fn open_collection(
         storage_cfg,
         shared_db: shared,
         tables,
+        refresh_interval_ms: std::sync::atomic::AtomicU64::new(0),
+        last_refresh: parking_lot::Mutex::new(std::time::Instant::now()),
+        pending_reindex: parking_lot::Mutex::new(ahash::AHashMap::new()),
     })
 }
 
@@ -1263,6 +1294,9 @@ fn bulk_write_one_db(
     }
 
     // Post-commit: update in-memory state (tombstones, postings index).
+    // Precompute per-collection deferral decision (refresh_interval).
+    // We hold `reindex_guards` across this entire block, so all
+    // decisions for a given col see a stable view of pending_reindex.
     for (it, r) in items.iter().zip(tx_results.into_iter()) {
         let col = &cols[it.col_i].0;
         let cname = &cols[it.col_i].2;
@@ -1274,20 +1308,31 @@ fn bulk_write_one_db(
                 match &it.kind {
                     BulkKind::Delete { .. } => {
                         col.tombstones.write().insert(tr.row_id);
+                        // If this row was pending reindex, it's moot now —
+                        // tombstone filters will keep it out of result sets.
+                        col.pending_reindex.lock().remove(&tr.row_id);
                         out.push((it.orig, BulkOutcome::ok(cname, BulkResult { id: tr.id, version: tr.version, action: "delete", created: false })));
                     }
                     BulkKind::Index { .. } | BulkKind::Create { .. } => {
                         col.tombstones.write().remove(tr.row_id);
-                        // Clear stale postings only when the row_id existed
-                        // before this write (overwrite or tombstone
-                        // resurrection). For a fresh row_id it's not in any
-                        // posting list — skipping the O(unique_terms) scan
-                        // is the main perf win for append-heavy workloads.
-                        if !tr.fresh {
-                            col.index.remove_row(tr.row_id);
-                        }
                         let src = &it.prep.as_ref().unwrap().source;
-                        {
+                        if should_defer_reindex(col) {
+                            // Defer: remember we need to (re)index this row,
+                            // preserving whether an earlier postings entry
+                            // exists for it.
+                            let mut pend = col.pending_reindex.lock();
+                            let entry = pend.entry(tr.row_id).or_insert(PendingEntry { need_remove_row: !tr.fresh });
+                            entry.need_remove_row |= !tr.fresh;
+                            // Still merge schema so that dynamic mappings
+                            // stay current for future writes. Cheap.
+                            let mut schema = col.schema.write();
+                            fc.merge_from_record(&col.name, src);
+                            if let Some(cs) = fc.get(&col.name) { *schema = cs; }
+                        } else {
+                            // Apply any previously-deferred items before this one
+                            // so the postings reflect insertion order.
+                            drain_pending_reindex(col, fc);
+                            if !tr.fresh { col.index.remove_row(tr.row_id); }
                             let mut schema = col.schema.write();
                             index_one(&col.index, &mut schema, tr.row_id, src);
                         }
@@ -1300,15 +1345,18 @@ fn bulk_write_one_db(
                     }
                     BulkKind::Update { .. } | BulkKind::Script { .. } => {
                         col.tombstones.write().remove(tr.row_id);
-                        // reindex_lock already held at the outer scope.
-                        col.index.remove_row(tr.row_id);
-                        // Rebuild postings for the now-current doc: we
-                        // wrote `cur` (base + patch) above; re-read it
-                        // cheaply from the collection.
-                        if let Ok(Some((_, _, bytes))) = col.get_by_id(&tr.id) {
-                            if let Ok(src) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                let mut schema = col.schema.write();
-                                index_one(&col.index, &mut schema, tr.row_id, &src);
+                        if should_defer_reindex(col) {
+                            let mut pend = col.pending_reindex.lock();
+                            let entry = pend.entry(tr.row_id).or_insert(PendingEntry { need_remove_row: true });
+                            entry.need_remove_row = true;
+                        } else {
+                            drain_pending_reindex(col, fc);
+                            col.index.remove_row(tr.row_id);
+                            if let Ok(Some((_, _, bytes))) = col.get_by_id(&tr.id) {
+                                if let Ok(src) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                    let mut schema = col.schema.write();
+                                    index_one(&col.index, &mut schema, tr.row_id, &src);
+                                }
                             }
                         }
                         out.push((it.orig, BulkOutcome::ok(cname, BulkResult { id: tr.id, version: tr.version, action: "update", created: false })));
@@ -1325,6 +1373,52 @@ fn bulk_write_one_db(
 }
 
 fn uuid_like() -> String { uuid_fast() }
+
+/// True iff postings updates for this collection should be deferred.
+/// Based on refresh_interval_ms and the pending buffer ceiling.
+fn should_defer_reindex(col: &Arc<Collection>) -> bool {
+    let interval = col.refresh_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+    if interval == 0 { return false; }
+    if col.pending_reindex.lock().len() >= PENDING_MAX { return false; }
+    let last = *col.last_refresh.lock();
+    if last.elapsed().as_millis() as u64 >= interval { return false; }
+    true
+}
+
+/// Apply all pending (row_id -> PendingEntry) entries for `col`.
+/// Called from `Engine::refresh` and from the bulk path when the
+/// deferral window expires or the pending buffer fills.
+///
+/// Caller must hold `col.reindex_lock` in exclusive mode while this
+/// runs so search readers don't observe a row temporarily missing
+/// from postings.
+pub(crate) fn drain_pending_reindex(col: &Arc<Collection>, fc: &Arc<FieldCatalog>) {
+    let mut pend = col.pending_reindex.lock();
+    if pend.is_empty() { return; }
+    let entries: Vec<(u32, PendingEntry)> = pend.drain().collect();
+    drop(pend);
+    for (row_id, entry) in entries {
+        // Skip tombstoned rows — search already filters them by tombstone
+        // set; no need to spend cycles on them.
+        if col.tombstones.read().contains(row_id) { continue; }
+        // Read the current doc bytes.
+        let source = match col.hydrate_rows(&[row_id], false, true) {
+            Ok(mut v) => match v.pop() {
+                Some((_, Some(bytes))) => match serde_json::from_slice::<serde_json::Value>(&bytes) { Ok(s) => s, Err(_) => continue },
+                _ => continue,
+            },
+            Err(_) => continue,
+        };
+        if entry.need_remove_row { col.index.remove_row(row_id); }
+        let mut schema = col.schema.write();
+        fc.merge_from_record(&col.name, &source);
+        if let Some(cs) = fc.get(&col.name) { *schema = cs; }
+        index_one(&col.index, &mut schema, row_id, &source);
+    }
+    *col.last_refresh.lock() = std::time::Instant::now();
+    col.sort_cache.write().clear();
+    col.sort_range.write().clear();
+}
 
 // Tiny non-crypto id. Per-thread xorshift seeded once; avoids reseeding from
 // the clock on every call (which produced duplicate ids under burst load).
