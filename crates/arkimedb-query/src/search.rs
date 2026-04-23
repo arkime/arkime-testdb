@@ -251,64 +251,39 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
                 per_col_info.push((col, bm, map, min, max));
             }
 
-            // Order cols by the extremum in sort direction.
-            // asc → sort by min asc; desc → sort by max desc.
-            per_col_info.sort_by(|a, b| {
-                let (amin, amax) = (&a.3, &a.4);
-                let (bmin, bmax) = (&b.3, &b.4);
-                if ss.ascending { cmp_scalar(amin, bmin) } else { cmp_scalar(bmax, amax) }
-            });
+            // Ordering across cols no longer needed: we take the top page_end
+            // from each and globally merge-sort afterwards.
 
             let mut out_hits: Vec<(Arc<Collection>, u32, Option<arkimedb_core::Scalar>)> = Vec::new();
 
-            // If unindexed cols exist and their rows sort to the FRONT
-            // (missing_first for asc, or missing_last==false; mirror for desc),
-            // prepend them. Otherwise append.
-            let missing_front = if ss.ascending { !ss.missing_last } else { !ss.missing_last };
-            if missing_front {
-                for (col, bm) in &per_col_unindexed {
-                    for r in bm.iter() { out_hits.push((col.clone(), r, None)); }
-                }
-            }
-
-            for (i, (col, bm, map, _min, _max)) in per_col_info.iter().enumerate() {
-                // Sort rows in this collection by the cached scalar.
+            // Take top page_end per collection (locally sorted), accumulate,
+            // then globally sort. Correct regardless of whether per-col
+            // extremum ordering is exact over the filtered subset.
+            for (col, bm, map, _min, _max) in per_col_info.iter() {
                 let mut local: Vec<(u32, Option<arkimedb_core::Scalar>)> = bm.iter()
                     .map(|r| (r, map.get(&r).cloned())).collect();
                 local.sort_by(|a, b| {
                     let ord = cmp_scalar_opt(a.1.as_ref(), b.1.as_ref(), ss.missing_last);
                     if ss.ascending { ord } else { ord.reverse() }
                 });
+                local.truncate(page_end);
                 for (r, sc) in local { out_hits.push((col.clone(), r, sc)); }
-
-                // Early stop: need enough hits AND next col's best extremum
-                // can't beat current tail AND no unindexed "missing" rows
-                // need to be placed AFTER (would affect the page).
-                if out_hits.len() >= page_end && i + 1 < per_col_info.len() {
-                    let tail = &out_hits[page_end - 1].2;
-                    let next_best = if ss.ascending { &per_col_info[i + 1].3 } else { &per_col_info[i + 1].4 };
-                    let stop = match tail {
-                        Some(t) => {
-                            let ord = cmp_scalar(t, next_best);
-                            if ss.ascending { ord.is_lt() || ord.is_eq() } else { ord.is_gt() || ord.is_eq() }
-                        }
-                        None => false,
-                    };
-                    if stop { break; }
+            }
+            // Unindexed cols contribute rows with `None` sort values; they
+            // sort to first/last based on missing_last. Cap per-col too.
+            for (col, bm) in &per_col_unindexed {
+                let mut cnt = 0usize;
+                for r in bm.iter() {
+                    if cnt >= page_end { break; }
+                    out_hits.push((col.clone(), r, None));
+                    cnt += 1;
                 }
             }
-
-            if !missing_front {
-                // Only materialize unindexed tail if page hasn't been filled
-                // entirely by indexed cols; otherwise these rows can't enter
-                // the page at all (they're beyond the tail).
-                if out_hits.len() < page_end {
-                    for (col, bm) in &per_col_unindexed {
-                        for r in bm.iter() { out_hits.push((col.clone(), r, None)); }
-                        if out_hits.len() >= page_end { break; }
-                    }
-                }
-            }
+            // Global merge-sort of the per-collection tops.
+            out_hits.sort_by(|a, b| {
+                let ord = cmp_scalar_opt(a.2.as_ref(), b.2.as_ref(), ss.missing_last);
+                if ss.ascending { ord } else { ord.reverse() }
+            });
 
             // Pagination.
             let end = page_end.min(out_hits.len());
