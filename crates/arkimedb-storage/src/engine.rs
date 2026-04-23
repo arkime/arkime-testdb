@@ -770,7 +770,7 @@ fn write_doc_in_tx(
     id: &str,
     compressed: &[u8],
     require_create: bool,
-) -> Result<(u32, bool, u64)> {
+) -> Result<(u32, bool, u64, bool)> {
     let mut id2row = w.open_table(t.id2row)?;
     let existing = id2row.get(id)?.map(|v| v.value());
     // A prior delete tombstones the row but leaves id2row mapped. Treat a
@@ -785,16 +785,16 @@ fn write_doc_in_tx(
         }
         None => false,
     };
-    let (row_id, created) = match existing {
+    let (row_id, created, fresh) = match existing {
         Some(r) if !tombstoned => {
             if require_create { return Err(Error::Conflict(format!("document already exists: {id}"))); }
-            (r, false)
+            (r, false, false)
         }
         Some(r) => {
             // Resurrecting a tombstoned row.
             let mut tt = w.open_table(t.tombstones)?;
             tt.remove(r)?;
-            (r, true)
+            (r, true, false)
         }
         None => {
             let mut meta = w.open_table(t.meta)?;
@@ -804,7 +804,7 @@ fn write_doc_in_tx(
             id2row.insert(id, cur as u32)?;
             let mut row2id = w.open_table(t.row2id)?;
             row2id.insert(cur as u32, id)?;
-            (cur as u32, true)
+            (cur as u32, true, true)
         }
     };
     drop(id2row);
@@ -824,7 +824,7 @@ fn write_doc_in_tx(
         let cur = meta.get("doc_count")?.map(|v| v.value()).unwrap_or(0);
         meta.insert("doc_count", cur + 1)?;
     }
-    Ok((row_id, created, version))
+    Ok((row_id, created, version, fresh))
 }
 
 fn delete_doc_in_tx(w: &redb::WriteTransaction, t: &CollTables, id: &str) -> Result<Option<u32>> {
@@ -862,12 +862,12 @@ fn write_one(col: &Arc<Collection>, fc: &Arc<FieldCatalog>, id: Option<String>, 
     let compressed = codec::compress(&bytes, col.storage_cfg.zstd_level)?;
     let mut w = col.db.begin_write()?;
     w.set_durability(redb::Durability::Eventual);
-    let (row_id, created, version) = write_doc_in_tx(&w, &col.tables, &id, &compressed, require_create)?;
+    let (row_id, created, version, fresh) = write_doc_in_tx(&w, &col.tables, &id, &compressed, require_create)?;
     w.commit()?;
     col.sort_cache.write().clear();
     col.sort_range.write().clear();
     col.tombstones.write().remove(row_id);
-    if !created {
+    if !fresh {
         col.index.remove_row(row_id);
     }
     {
@@ -930,7 +930,7 @@ fn write_many_in_one_tx(
     w.set_durability(redb::Durability::Eventual);
 
     // per-op in-tx writes; collect (prep-index, row_id, created, version)
-    let mut in_tx_results: Vec<std::result::Result<(usize, String, u32, bool, u64), Error>> =
+    let mut in_tx_results: Vec<std::result::Result<(usize, String, u32, bool, u64, bool), Error>> =
         Vec::with_capacity(preps.len());
     for (pi, p) in preps.iter().enumerate() {
         match p {
@@ -938,8 +938,8 @@ fn write_many_in_one_tx(
             Ok(p) => {
                 let id = p.id.clone().unwrap_or_else(uuid_like);
                 match write_doc_in_tx(&w, &col.tables, &id, &p.compressed, p.require_create) {
-                    Ok((row_id, created, version)) => {
-                        in_tx_results.push(Ok((pi, id, row_id, created, version)));
+                    Ok((row_id, created, version, fresh)) => {
+                        in_tx_results.push(Ok((pi, id, row_id, created, version, fresh)));
                     }
                     Err(e) => in_tx_results.push(Err(e)),
                 }
@@ -964,12 +964,15 @@ fn write_many_in_one_tx(
         let Some(r) = tx_iter.next() else { break; };
         match r {
             Err(e) => results[pi] = Err(e),
-            Ok((_, id, row_id, created, version)) => {
+            Ok((_, id, row_id, created, version, fresh)) => {
                 col.tombstones.write().remove(row_id);
-                // Always clear stale postings before re-indexing (handles
-                // tombstoned-row resurrection where created=true but old
-                // postings remain).
-                col.index.remove_row(row_id);
+                // Only clear stale postings if the row existed previously
+                // (overwrite or tombstone resurrection). A truly fresh
+                // row_id is not present in any posting list — skipping the
+                // O(unique_terms) scan is the main perf win here.
+                if !fresh {
+                    col.index.remove_row(row_id);
+                }
                 {
                     let mut schema = col.schema.write();
                     let src = &preps[pi].as_ref().unwrap().source;
@@ -1160,7 +1163,7 @@ fn bulk_write_one_db(
     w.set_durability(redb::Durability::Eventual);
 
     // Per-op results inside the tx.
-    struct TxRes { row_id: u32, created: bool, version: u64, id: String }
+    struct TxRes { row_id: u32, created: bool, version: u64, id: String, fresh: bool }
     let mut tx_results: Vec<std::result::Result<TxRes, Error>> = Vec::with_capacity(items.len());
     for it in &items {
         let col = &cols[it.col_i].0;
@@ -1174,13 +1177,13 @@ fn bulk_write_one_db(
                 }
                 let id = prep.id.clone().unwrap_or_else(uuid_like);
                 match write_doc_in_tx(&w, t, &id, &prep.compressed, prep.require_create) {
-                    Ok((row_id, created, version)) => tx_results.push(Ok(TxRes { row_id, created, version, id })),
+                    Ok((row_id, created, version, fresh)) => tx_results.push(Ok(TxRes { row_id, created, version, id, fresh })),
                     Err(e) => tx_results.push(Err(e)),
                 }
             }
             BulkKind::Delete { id } => {
                 match delete_doc_in_tx(&w, t, id) {
-                    Ok(Some(row_id)) => tx_results.push(Ok(TxRes { row_id, created: false, version: 0, id: id.clone() })),
+                    Ok(Some(row_id)) => tx_results.push(Ok(TxRes { row_id, created: false, version: 0, id: id.clone(), fresh: false })),
                     Ok(None) => tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))),
                     Err(e) => tx_results.push(Err(e)),
                 }
@@ -1213,7 +1216,7 @@ fn bulk_write_one_db(
                 let bytes = match serde_json::to_vec(&cur) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
                 let compressed = match codec::compress(&bytes, col.storage_cfg.zstd_level) { Ok(c) => c, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } };
                 match write_doc_in_tx(&w, t, id, &compressed, false) {
-                    Ok((row_id, _created, version)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone() })),
+                    Ok((row_id, _created, version, _fresh)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone(), fresh: false })),
                     Err(e) => tx_results.push(Err(e)),
                 }
             }
@@ -1242,7 +1245,7 @@ fn bulk_write_one_db(
                 let bytes = match serde_json::to_vec(&cur) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
                 let compressed = match codec::compress(&bytes, col.storage_cfg.zstd_level) { Ok(c) => c, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } };
                 match write_doc_in_tx(&w, t, id, &compressed, false) {
-                    Ok((row_id, _created, version)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone() })),
+                    Ok((row_id, _created, version, _fresh)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone(), fresh: false })),
                     Err(e) => tx_results.push(Err(e)),
                 }
             }
@@ -1275,14 +1278,14 @@ fn bulk_write_one_db(
                     }
                     BulkKind::Index { .. } | BulkKind::Create { .. } => {
                         col.tombstones.write().remove(tr.row_id);
-                        // Always clear stale postings for this row before
-                        // re-indexing. Covers three cases:
-                        //   - overwrite of an existing live doc,
-                        //   - resurrection of a tombstoned row (same id,
-                        //     previously deleted; tr.created=true but old
-                        //     postings still point at this row_id),
-                        //   - truly new row (no-op on an empty row).
-                        col.index.remove_row(tr.row_id);
+                        // Clear stale postings only when the row_id existed
+                        // before this write (overwrite or tombstone
+                        // resurrection). For a fresh row_id it's not in any
+                        // posting list — skipping the O(unique_terms) scan
+                        // is the main perf win for append-heavy workloads.
+                        if !tr.fresh {
+                            col.index.remove_row(tr.row_id);
+                        }
                         let src = &it.prep.as_ref().unwrap().source;
                         {
                             let mut schema = col.schema.write();
