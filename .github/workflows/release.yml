@@ -95,6 +95,36 @@ jobs:
           name: ${{ needs.version.outputs.tag }}
           draft: false
           prerelease: false
+          generate_release_notes: true
+          append_body: true
+          body: |
+            ## Install
+
+            ### Linux
+
+            ```sh
+            curl -L -o arkimedb https://github.com/arkime/arkime-testdb/releases/download/${{ needs.version.outputs.tag }}/arkimedb-linux-amd64
+            #   or arkimedb-linux-arm64
+            chmod +x arkimedb
+            ./arkimedb serve --data-dir ./data --port 9200
+            ```
+
+            ### macOS (Apple Silicon)
+
+            macOS quarantines downloaded binaries. Strip the quarantine
+            attribute before first run, otherwise Gatekeeper will refuse
+            to launch it:
+
+            ```sh
+            curl -L -o arkimedb https://github.com/arkime/arkime-testdb/releases/download/${{ needs.version.outputs.tag }}/arkimedb-macos-arm64
+            xattr -d com.apple.quarantine arkimedb
+            chmod +x arkimedb
+            ./arkimedb serve --data-dir ./data --port 9200
+            ```
+
+            Then point Arkime at `http://localhost:9200` as you would Elasticsearch.
+
+            See the [README](https://github.com/arkime/arkime-testdb#readme) for flags and details.
           files: |
             dist/arkimedb-linux-amd64
             dist/arkimedb-linux-amd64.sha256
