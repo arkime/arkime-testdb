@@ -807,16 +807,35 @@ consistency; §18.2 just has to be right.
 Keep `reindex_lock.write()` in bulk itself, sorted by Arc pointer
 across the collections a bulk touches, to prevent bulk-bulk deadlock.
 
-### 18.4 Per-doc update lock for the tagging race
+### 18.4 Per-doc update lock was insufficient — script RMW must be inside the tx
 
-Arkime's tagging issues `_update` with `doc:{...}` on the same session
-concurrently from multiple workers. Read-modify-write races produced
-"last writer wins" losses — tags dropped, not duplicated.
+First cut of `_update` with painless scripts (the tagging path) used a
+`DashMap<String, Arc<Mutex<()>>>` keyed by `(index, id)` around a
+read-in-HTTP-layer / mutate / `bulk_write(Index)` sequence. This
+serialized *script* updates to the same doc but left a real hole:
 
-Fix: a `DashMap<String, Arc<Mutex<()>>>` keyed by `(index, id)` held
-for the full read-merge-write of a single doc. No global lock, no
-interference across docs. Combined with §18.3 this is the right
-granularity: per-doc atomicity, no per-collection stop-the-world.
+* The read happened **outside** the collection's `reindex_lock`.
+* The write (`bulk_write(Index)` with the pre-computed full source)
+  took `reindex_lock.write()` only for its own commit.
+* Another writer — a plain `PUT /_doc/:id`, a bulk `index`, a capture
+  re-write — could commit in between and be silently clobbered.
+
+Symptom: `api-tagging.t` flaked under full-suite load. `removetags`
+across 3 sessions would leave 1 session still tagged ~1 run in 3.
+Isolated it always passed.
+
+Real fix: make the script update a first-class op (`BulkKind::Script
+{ id, mutator }`) handled *inside* `bulk_write_one_db`, same shape as
+`BulkKind::Update`. The closure that implements the painless pattern
+(`ctx._source.tags.add/remove`, etc.) is invoked between the tx-level
+read and tx-level write, all under the outer `reindex_lock.write()`.
+No per-doc lock map, no HTTP-layer read of the doc at all.
+
+Takeaway: read-modify-write through an HTTP layer is **not** atomic
+even with a per-doc mutex, because the surrounding storage lets other
+paths write too. Push RMW into the same transaction + lock scope as
+every other mutation, or you will reproduce MongoDB's 2013-era
+`findAndModify` bugs.
 
 ### 18.5 Cache invalidation scope = per collection, not global
 
@@ -991,6 +1010,34 @@ the on-disk size for a tests_* dataset. If disk is the #1 priority
 with a table per day, not a redb per day. Retrofitting this is
 painful; doing it early isn't. We chose "monthly sessions in one
 redb" as a compromise (§checkpoint 025).
+
+### 20.6 "Works in ES" != "works in our clone"
+
+A failing test against our backend is **never** a case of "Arkime
+plus ES would do the wrong thing here too." Every flake we've seen —
+tagging, deletes, counts after refresh, duplicate session ids on
+resurrection — resolved to a specific semantic ES provides that we'd
+stubbed, skipped, or approximated. When the user says "this works
+against ES," treat it as the highest-quality bug report you get. The
+answers have been, in order of frequency:
+
+1. A reader saw a commit before in-memory postings were updated
+   (fix: hold `reindex_lock.write()` across commit **and**
+   post-commit index updates; §18.3, §20.4).
+2. A tombstoned row got resurrected but old field postings still
+   pointed at its row_id (fix: unconditional `remove_row` before
+   `index_one` in the Index/Create post-commit path; §15).
+3. `?refresh=true` on a single-doc endpoint was honoured as "store
+   it" instead of "store it + refresh" (fix: treat it as an explicit
+   `engine.refresh(Some(idx))` barrier after the write, same as ES).
+4. A script `_update` read the doc outside the tx, let another writer
+   race in, then wrote its stale view (fix: `BulkKind::Script` with
+   in-tx RMW; §18.4).
+
+Pattern: almost all of these present as "the count should be N, it
+was N±1 or N±2 under load; alone it's fine." That's the fingerprint
+of a lost write or a stale read, not of Arkime logic.
+
 
 ---
 

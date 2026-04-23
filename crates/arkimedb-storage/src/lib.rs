@@ -21,5 +21,5 @@ pub mod codec;
 // Re-export commonly used types at the crate root.
 pub use postings::PostingsIndex;
 
-pub use engine::{Engine, Collection, BulkOutcome, BulkResult, GetResult, DocHit};
+pub use engine::{Engine, Collection, BulkOutcome, BulkResult, GetResult, DocHit, BulkKind, BulkOp, ScriptMutator};
 pub use catalog::GlobalCatalog;

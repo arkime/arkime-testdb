@@ -1025,41 +1025,29 @@ async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J)
     let params = script.get("params").cloned().unwrap_or(J::Null);
     // Find the collection containing the doc.
     let cols = match s.engine.resolve(idx) { Ok(v) => v, Err(e) => return internal(e) };
-    let mut found: Option<(Arc<arkimedb_storage::Collection>, Vec<u8>)> = None;
-    let mut found_col_name: Option<String> = None;
+    let mut col_name: Option<String> = None;
     for c in cols {
-        if let Ok(Some((_rid, _ver, raw))) = c.get_by_id(id) {
-            found_col_name = Some(c.name.clone());
-            found = Some((c, raw));
-            break;
-        }
+        if let Ok(Some(_)) = c.get_by_id(id) { col_name = Some(c.name.clone()); break; }
     }
-    let (col, _raw_first) = match found {
-        Some(x) => x,
-        None => return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}")),
+    let Some(col_name) = col_name else {
+        return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}"));
     };
-    // Acquire the per-doc update lock so concurrent script updates to the
-    // same doc serialize their read-modify-write cycles.
-    let lock_key = format!("{}/{}", found_col_name.as_deref().unwrap_or(""), id);
-    let lock = {
-        let mut map = s.update_locks.lock();
-        map.entry(lock_key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    // Build a mutator closure that captures the painless script + params,
+    // and runs apply_script_mutation. This is executed inside the write
+    // transaction under reindex_lock, so the whole read-modify-write is
+    // atomic w.r.t. other writers on the collection.
+    let src_for_closure = src_text.clone();
+    let params_for_closure = params.clone();
+    let mutator: arkimedb_storage::ScriptMutator = std::sync::Arc::new(move |cur: &mut J| {
+        apply_script_mutation(cur, &src_for_closure, &params_for_closure)
+    });
+    let op = BulkOp {
+        collection: Some(col_name.clone()),
+        kind: BulkKind::Script { id: id.to_string(), mutator },
     };
-    let _guard = lock.lock().await;
-    // Re-read inside the lock — another concurrent update may have just
-    // committed a newer version.
-    let raw = match col.get_by_id(id) {
-        Ok(Some((_rid, _ver, raw))) => raw,
-        Ok(None) => return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}")),
-        Err(e) => return internal(e),
-    };
-    let mut cur: J = match serde_json::from_slice(&raw) { Ok(v) => v, Err(e) => return internal(Error::BadRequest(e.to_string())) };
-    if let Err(e) = apply_script_mutation(&mut cur, &src_text, &params) {
-        return internal(e);
-    }
-    let op = BulkOp { collection: Some(col.name.clone()), kind: BulkKind::Index { id: Some(id.to_string()), source: cur } };
-    let res = s.engine.bulk_write(Some(&col.name), vec![op]);
-    match res {
+    let engine = s.engine.clone();
+    let col_name_c = col_name.clone();
+    match blocking(move || engine.bulk_write(Some(&col_name_c), vec![op])).await {
         Ok(mut v) => {
             let mut o = v.pop().unwrap();
             if let Some(ref mut r) = o.ok { r.action = "update"; }

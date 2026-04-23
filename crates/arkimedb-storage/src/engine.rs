@@ -611,18 +611,38 @@ impl Engine {
 
 // --- bulk op model --------------------------------------------------------
 
-#[derive(Debug)]
 pub enum BulkKind {
     Index  { id: Option<String>, source: serde_json::Value },
     Create { id: String,          source: serde_json::Value },
     Update { id: String,          doc: serde_json::Value },
     Delete { id: String },
+    /// Read-modify-write under the write tx + reindex_lock (atomic like ES
+    /// `_update` with script). Mutator is applied in-place on the current
+    /// source JSON. Must be deterministic / side-effect free.
+    Script { id: String, mutator: ScriptMutator },
 }
+
+/// Boxed callback that mutates a source document in place. Applied inside
+/// the write transaction so the read-modify-write is atomic w.r.t. other
+/// writers on the same collection.
+pub type ScriptMutator = std::sync::Arc<dyn Fn(&mut serde_json::Value) -> Result<()> + Send + Sync>;
 
 #[derive(Debug)]
 pub struct BulkOp {
     pub collection: Option<String>,
     pub kind: BulkKind,
+}
+
+impl std::fmt::Debug for BulkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BulkKind::Index { id, .. }  => f.debug_struct("Index").field("id", id).finish(),
+            BulkKind::Create { id, .. } => f.debug_struct("Create").field("id", id).finish(),
+            BulkKind::Update { id, .. } => f.debug_struct("Update").field("id", id).finish(),
+            BulkKind::Delete { id }     => f.debug_struct("Delete").field("id", id).finish(),
+            BulkKind::Script { id, .. } => f.debug_struct("Script").field("id", id).finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1034,6 +1054,7 @@ fn bulk_write_one_db(
                 BulkKind::Create { id, source } => BulkKind::Create { id: id.clone(), source: source.clone() },
                 BulkKind::Delete { id } => BulkKind::Delete { id: id.clone() },
                 BulkKind::Update { id, doc } => BulkKind::Update { id: id.clone(), doc: doc.clone() },
+                BulkKind::Script { id, mutator } => BulkKind::Script { id: id.clone(), mutator: mutator.clone() },
             };
             let prep = match &op.kind {
                 BulkKind::Index { id: idx_id, source } => {
@@ -1171,9 +1192,9 @@ fn bulk_write_one_db(
                 let id2row = match w.open_table(t.id2row) { Ok(x) => x, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
                 let row_id_opt = match id2row.get(id.as_str()) { Ok(v) => v.map(|x| x.value()), Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
                 drop(id2row);
-                let Some(row_id) = row_id_opt else { tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))); continue; };
+                let Some(_row_id) = row_id_opt else { tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))); continue; };
                 let docs = match w.open_table(t.docs) { Ok(x) => x, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
-                let cur_bytes = match docs.get(row_id) {
+                let cur_bytes = match docs.get(_row_id) {
                     Ok(Some(v)) => match codec::decompress(v.value()) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } },
                     Ok(None) => { tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))); continue; }
                     Err(e) => { tx_results.push(Err(Error::from(e))); continue; }
@@ -1183,6 +1204,35 @@ fn bulk_write_one_db(
                 if let (serde_json::Value::Object(base), serde_json::Value::Object(patch)) = (&mut cur, doc.clone()) {
                     for (k, v) in patch { base.insert(k, v); }
                 }
+                let col = &cols[it.col_i].0;
+                let changed = fc.merge_from_record(&col.name, &cur);
+                if changed {
+                    let mut s = col.schema.write();
+                    if let Some(cs) = fc.get(&col.name) { *s = cs; }
+                }
+                let bytes = match serde_json::to_vec(&cur) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                let compressed = match codec::compress(&bytes, col.storage_cfg.zstd_level) { Ok(c) => c, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } };
+                match write_doc_in_tx(&w, t, id, &compressed, false) {
+                    Ok((row_id, _created, version)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone() })),
+                    Err(e) => tx_results.push(Err(e)),
+                }
+            }
+            BulkKind::Script { id, mutator } => {
+                // Same atomic read-modify-write as Update, but the mutation
+                // is a user-provided closure (e.g. painless add/remove tags).
+                let id2row = match w.open_table(t.id2row) { Ok(x) => x, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                let row_id_opt = match id2row.get(id.as_str()) { Ok(v) => v.map(|x| x.value()), Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                drop(id2row);
+                let Some(row_id_cur) = row_id_opt else { tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))); continue; };
+                let docs = match w.open_table(t.docs) { Ok(x) => x, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                let cur_bytes = match docs.get(row_id_cur) {
+                    Ok(Some(v)) => match codec::decompress(v.value()) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } },
+                    Ok(None) => { tx_results.push(Err(Error::NotFound(format!("doc {id} not found")))); continue; }
+                    Err(e) => { tx_results.push(Err(Error::from(e))); continue; }
+                };
+                drop(docs);
+                let mut cur: serde_json::Value = match serde_json::from_slice(&cur_bytes) { Ok(v) => v, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
+                if let Err(e) = (mutator)(&mut cur) { tx_results.push(Err(e)); continue; }
                 let col = &cols[it.col_i].0;
                 let changed = fc.merge_from_record(&col.name, &cur);
                 if changed {
@@ -1245,7 +1295,7 @@ fn bulk_write_one_db(
                             created: tr.created,
                         })));
                     }
-                    BulkKind::Update { .. } => {
+                    BulkKind::Update { .. } | BulkKind::Script { .. } => {
                         col.tombstones.write().remove(tr.row_id);
                         // reindex_lock already held at the outer scope.
                         col.index.remove_row(tr.row_id);
