@@ -139,6 +139,8 @@ pub struct SearchRequest {
     pub fields: Option<Vec<J>>,
     pub docvalue_fields: Option<Vec<J>>,
     pub stored_fields: Option<Vec<J>>,
+    #[serde(default)]
+    pub version: bool,
     #[serde(skip)]
     pub _extra: (),
 }
@@ -156,6 +158,7 @@ impl Default for SearchRequest {
             fields: None,
             docvalue_fields: None,
             stored_fields: None,
+            version: false,
             _extra: (),
         }
     }
@@ -379,6 +382,9 @@ fn hydrate_and_respond(
     for (_, (col, idxs)) in by_col {
         let rows: Vec<u32> = idxs.iter().map(|&i| slice[i].1).collect();
         let loaded = col.hydrate_rows(&rows, true, want_raw)?;
+        let versions: Option<Vec<u64>> = if req.version {
+            Some(col.versions_for_rows(&rows)?)
+        } else { None };
         let schema_guard = if want_fields { Some(col.schema.read()) } else { None };
         for (k, &slot) in idxs.iter().enumerate() {
             let (id_opt, raw_opt) = loaded[k].clone();
@@ -471,7 +477,7 @@ fn hydrate_and_respond(
             hits[slot] = Hit {
                 _index: col.name.clone(),
                 _id: id,
-                _version: 1,
+                _version: versions.as_ref().map(|v| v[k]).unwrap_or(1),
                 _source: source_val,
                 fields: fields_val,
                 sort: sort_val,

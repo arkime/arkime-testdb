@@ -1395,6 +1395,7 @@ struct SearchQ {
     rest_total_hits_as_int: Option<bool>,
     q: Option<String>,
     sort: Option<String>,
+    version: Option<bool>,
 }
 
 /// Convert a tiny subset of Lucene query-string syntax (`field:value`) into an
@@ -1575,6 +1576,7 @@ async fn search_impl(
     };
     if let Some(sz) = q.size { req.size = sz; }
     if let Some(fr) = q.from { req.from = fr; }
+    if q.version == Some(true) { req.version = true; }
 
     let no_indices = cols.is_empty();
     let cols_for_search = cols.clone();

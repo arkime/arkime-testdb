@@ -155,6 +155,18 @@ impl Collection {
         Ok(out)
     }
 
+    /// Look up versions for a batch of row ids (single read tx).
+    /// Returns 1 for rows with no version row (legacy/missing).
+    pub fn versions_for_rows(&self, rows: &[u32]) -> Result<Vec<u64>> {
+        let r = self.db.begin_read()?;
+        let vt = r.open_table(self.tables.versions)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for &row_id in rows {
+            out.push(vt.get(row_id)?.map(|v| v.value()).unwrap_or(1));
+        }
+        Ok(out)
+    }
+
     pub fn next_row_id(&self, w: &redb::WriteTransaction) -> Result<u32> {
         let mut t = w.open_table(self.tables.meta)?;
         let cur = t.get("next_row_id")?.map(|v| v.value()).unwrap_or(0);
