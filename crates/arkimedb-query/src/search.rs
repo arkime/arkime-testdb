@@ -348,7 +348,7 @@ pub fn build_sort_cache(col: &Arc<Collection>, field: &str)
 }
 
 fn hydrate_and_respond(
-    cols: &[Arc<Collection>],
+    _cols: &[Arc<Collection>],
     req: &SearchRequest,
     t0: std::time::Instant,
     slice_hits: Vec<(Arc<Collection>, u32)>,

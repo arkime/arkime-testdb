@@ -880,7 +880,7 @@ fn is_refresh_true(v: &Option<String>) -> bool {
 
 async fn index_doc_auto_id(Path(idx): Path<String>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
-    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: None, source: body } };
+    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: None, source: body, force_version: None } };
     let engine = s.engine.clone();
     let refresh = is_refresh_true(&q.refresh);
     let idx_c = idx.clone();
@@ -896,9 +896,9 @@ async fn index_doc_auto_id(Path(idx): Path<String>, State(s): State<Arc<AppState
 async fn index_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
     let kind = if q.op_type.as_deref() == Some("create") {
-        BulkKind::Create { id, source: body }
+        BulkKind::Create { id, source: body, force_version: None }
     } else {
-        BulkKind::Index { id: Some(id), source: body }
+        BulkKind::Index { id: Some(id), source: body, force_version: None }
     };
     let op = BulkOp { collection: Some(idx.clone()), kind };
     let engine = s.engine.clone();
@@ -915,7 +915,7 @@ async fn index_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<
 }
 async fn create_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
-    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Create { id, source: body } };
+    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Create { id, source: body, force_version: None } };
     let engine = s.engine.clone();
     let refresh = is_refresh_true(&q.refresh);
     let idx_c = idx.clone();
@@ -970,7 +970,7 @@ async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc
     let Some(src) = insert_body else {
         return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}"));
     };
-    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: Some(id), source: src } };
+    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Index { id: Some(id), source: src, force_version: None } };
     let engine = s.engine.clone();
     let refresh = is_refresh_true(&q.refresh);
     let idx_c = idx.clone();
@@ -1817,21 +1817,25 @@ async fn do_bulk(s: &Arc<AppState>, default_idx: Option<String>, q: BulkQ, body:
         let coll = meta.get("_index").and_then(|v| v.as_str()).map(String::from)
             .or(default_idx.clone());
         let id   = meta.get("_id").and_then(|v| v.as_str()).map(String::from);
+        let force_version = meta.get("version_type").and_then(|v| v.as_str())
+            .filter(|t| *t == "external" || *t == "external_gt" || *t == "external_gte")
+            .and_then(|_| meta.get("version").and_then(|v| v.as_u64()))
+            .filter(|v| *v > 0);
         let kind = match action.as_str() {
             "index" | "" => {
                 let src = match lines.next() { Some(s) => s, None => break };
                 let src_j: J = serde_json::from_str(src).unwrap_or(J::Null);
                 let op_type = meta.get("op_type").and_then(|v| v.as_str()).unwrap_or("");
                 if op_type == "create" {
-                    BulkKind::Create { id: id.unwrap_or_default(), source: src_j }
+                    BulkKind::Create { id: id.unwrap_or_default(), source: src_j, force_version }
                 } else {
-                    BulkKind::Index { id, source: src_j }
+                    BulkKind::Index { id, source: src_j, force_version }
                 }
             }
             "create" => {
                 let src = match lines.next() { Some(s) => s, None => break };
                 let src_j: J = serde_json::from_str(src).unwrap_or(J::Null);
-                BulkKind::Create { id: id.unwrap_or_default(), source: src_j }
+                BulkKind::Create { id: id.unwrap_or_default(), source: src_j, force_version }
             }
             "update" => {
                 let src = match lines.next() { Some(s) => s, None => break };

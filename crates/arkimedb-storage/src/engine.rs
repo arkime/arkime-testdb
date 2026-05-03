@@ -640,8 +640,8 @@ impl Engine {
 // --- bulk op model --------------------------------------------------------
 
 pub enum BulkKind {
-    Index  { id: Option<String>, source: serde_json::Value },
-    Create { id: String,          source: serde_json::Value },
+    Index  { id: Option<String>, source: serde_json::Value, force_version: Option<u64> },
+    Create { id: String,          source: serde_json::Value, force_version: Option<u64> },
     Update { id: String,          doc: serde_json::Value },
     Delete { id: String },
     /// Read-modify-write under the write tx + reindex_lock (atomic like ES
@@ -801,6 +801,7 @@ fn write_doc_in_tx(
     id: &str,
     compressed: &[u8],
     require_create: bool,
+    force_version: Option<u64>,
 ) -> Result<(u32, bool, u64, bool)> {
     let mut id2row = w.open_table(t.id2row)?;
     let existing = id2row.get(id)?.map(|v| v.value());
@@ -845,8 +846,16 @@ fn write_doc_in_tx(
     }
     let version = {
         let mut vt = w.open_table(t.versions)?;
-        let cur = vt.get(row_id)?.map(|v| v.value()).unwrap_or(0);
-        let new = cur + 1;
+        // External versioning: only honor force_version when the doc didn't
+        // already exist (i.e. created==true). For an update of an existing
+        // row we fall back to cur+1 — clients that want strict ES external
+        // versioning semantics on update should use a real ES.
+        let new = if let Some(v) = force_version.filter(|_| created) {
+            v
+        } else {
+            let cur = vt.get(row_id)?.map(|v| v.value()).unwrap_or(0);
+            cur + 1
+        };
         vt.insert(row_id, new)?;
         new
     };
@@ -876,177 +885,6 @@ fn delete_doc_in_tx(w: &redb::WriteTransaction, t: &CollTables, id: &str) -> Res
 }
 
 
-fn write_one(col: &Arc<Collection>, fc: &Arc<FieldCatalog>, id: Option<String>, source: serde_json::Value, require_create: bool) -> Result<BulkResult> {
-    if !matches!(source, serde_json::Value::Object(_)) {
-        return Err(Error::BadRequest("source must be a JSON object".into()));
-    }
-    // schema inference (field catalog update). Only sync into the per-collection
-    // schema when the catalog actually changed — the previous unconditional
-    // `fc.get(...)` clone was O(n_fields) on every single write.
-    let schema_changed = fc.merge_from_record(&col.name, &source);
-    if schema_changed {
-        let mut s = col.schema.write();
-        if let Some(cs) = fc.get(&col.name) { *s = cs; }
-    }
-    let id = id.unwrap_or_else(uuid_like);
-    let bytes = serde_json::to_vec(&source)?;
-    let compressed = codec::compress(&bytes, col.storage_cfg.zstd_level)?;
-    let mut w = col.db.begin_write()?;
-    w.set_durability(redb::Durability::Eventual);
-    let (row_id, created, version, fresh) = write_doc_in_tx(&w, &col.tables, &id, &compressed, require_create)?;
-    w.commit()?;
-    col.sort_cache.write().clear();
-    col.sort_range.write().clear();
-    col.tombstones.write().remove(row_id);
-    if !fresh {
-        col.index.remove_row(row_id);
-    }
-    {
-        let mut schema = col.schema.write();
-        index_one(&col.index, &mut schema, row_id, &source);
-    }
-    Ok(BulkResult { id, version, action: if created { "create" } else { "index" }, created })
-}
-
-/// Write many Index/Create ops for the same collection in a single redb
-/// write transaction. For each op we still update the in-memory posting
-/// index individually (preserving per-op ordering), but amortize the
-/// `begin_write()/commit()` round-trip — historically the single biggest
-/// cost in Arkime bulk ingest (thousands of one-doc commits per run).
-///
-/// Failures on a single doc (e.g. create on existing id) become per-item
-/// errors in the returned Vec; the transaction continues and commits the
-/// successful docs, matching how Elasticsearch's `_bulk` behaves.
-fn write_many_in_one_tx(
-    col: &Arc<Collection>,
-    fc: &Arc<FieldCatalog>,
-    ops: &[&BulkOp],
-) -> Result<Vec<std::result::Result<BulkResult, Error>>> {
-    // Precompute per-op schema-merge + compressed body outside the tx so
-    // the write transaction holds the global write lock for as little
-    // time as possible.
-    struct Prep {
-        id: Option<String>,
-        source: serde_json::Value,
-        compressed: Vec<u8>,
-        require_create: bool,
-        is_create: bool,
-    }
-    let mut preps: Vec<std::result::Result<Prep, Error>> = Vec::with_capacity(ops.len());
-    for op in ops {
-        let (id, source, is_create) = match &op.kind {
-            BulkKind::Index { id, source } => (id.clone(), source.clone(), false),
-            BulkKind::Create { id, source } => (Some(id.clone()), source.clone(), true),
-            _ => { preps.push(Err(Error::BadRequest("non-index op in batch".into()))); continue; }
-        };
-        if !matches!(source, serde_json::Value::Object(_)) {
-            preps.push(Err(Error::BadRequest("source must be a JSON object".into())));
-            continue;
-        }
-        let changed = fc.merge_from_record(&col.name, &source);
-        if changed {
-            let mut s = col.schema.write();
-            if let Some(cs) = fc.get(&col.name) { *s = cs; }
-        }
-        let bytes = match serde_json::to_vec(&source) {
-            Ok(b) => b, Err(e) => { preps.push(Err(Error::from(e))); continue; }
-        };
-        let compressed = match codec::compress(&bytes, col.storage_cfg.zstd_level) {
-            Ok(c) => c, Err(e) => { preps.push(Err(Error::Io(e))); continue; }
-        };
-        preps.push(Ok(Prep { id, source, compressed, require_create: is_create, is_create }));
-    }
-
-    let mut w = col.db.begin_write()?;
-    w.set_durability(redb::Durability::Eventual);
-
-    // per-op in-tx writes; collect (prep-index, row_id, created, version)
-    let mut in_tx_results: Vec<std::result::Result<(usize, String, u32, bool, u64, bool), Error>> =
-        Vec::with_capacity(preps.len());
-    for (pi, p) in preps.iter().enumerate() {
-        match p {
-            Err(_) => { /* carried through below */ }
-            Ok(p) => {
-                let id = p.id.clone().unwrap_or_else(uuid_like);
-                match write_doc_in_tx(&w, &col.tables, &id, &p.compressed, p.require_create) {
-                    Ok((row_id, created, version, fresh)) => {
-                        in_tx_results.push(Ok((pi, id, row_id, created, version, fresh)));
-                    }
-                    Err(e) => in_tx_results.push(Err(e)),
-                }
-            }
-        }
-    }
-    w.commit()?;
-
-    // Now apply in-memory index updates (postings + tombstone clear) in
-    // op-order. Match each success to its prep to get source back.
-    let mut results: Vec<std::result::Result<BulkResult, Error>> =
-        (0..preps.len()).map(|_| Err(Error::BadRequest("unset".into()))).collect();
-    // First, write back per-prep prep errors.
-    for (pi, p) in preps.iter().enumerate() {
-        if let Err(e) = p {
-            results[pi] = Err(Error::BadRequest(e.to_string()));
-        }
-    }
-    let mut tx_iter = in_tx_results.into_iter();
-    for (pi, p) in preps.iter().enumerate() {
-        if p.is_err() { continue; }
-        let Some(r) = tx_iter.next() else { break; };
-        match r {
-            Err(e) => results[pi] = Err(e),
-            Ok((_, id, row_id, created, version, fresh)) => {
-                col.tombstones.write().remove(row_id);
-                // Only clear stale postings if the row existed previously
-                // (overwrite or tombstone resurrection). A truly fresh
-                // row_id is not present in any posting list — skipping the
-                // O(unique_terms) scan is the main perf win here.
-                if !fresh {
-                    col.index.remove_row(row_id);
-                }
-                {
-                    let mut schema = col.schema.write();
-                    let src = &preps[pi].as_ref().unwrap().source;
-                    index_one(&col.index, &mut schema, row_id, src);
-                }
-                let is_create = preps[pi].as_ref().unwrap().is_create;
-                results[pi] = Ok(BulkResult {
-                    id, version,
-                    action: if is_create { "create" } else { "index" },
-                    created,
-                });
-            }
-        }
-    }
-    Ok(results)
-}
-
-fn delete_one(col: &Arc<Collection>, id: &str) -> Result<BulkResult> {
-    let mut w = col.db.begin_write()?;
-    w.set_durability(redb::Durability::Eventual);
-    let row_id = match delete_doc_in_tx(&w, &col.tables, id)? {
-        Some(r) => r,
-        None => { w.commit()?; return Err(Error::NotFound(format!("doc {id} not found"))); }
-    };
-    w.commit()?;
-    col.tombstones.write().insert(row_id);
-    Ok(BulkResult { id: id.to_string(), version: 0, action: "delete", created: false })
-}
-
-fn update_one(col: &Arc<Collection>, fc: &Arc<FieldCatalog>, id: &str, doc: serde_json::Value) -> Result<BulkResult> {
-    let (row_id, _version, cur_bytes) = col.get_by_id(id)?
-        .ok_or_else(|| Error::NotFound(format!("doc {id} not found")))?;
-    let _ = row_id;
-    let mut cur: serde_json::Value = serde_json::from_slice(&cur_bytes)?;
-    if let (serde_json::Value::Object(base), serde_json::Value::Object(patch)) = (&mut cur, doc.clone()) {
-        for (k, v) in patch { base.insert(k, v); }
-    }
-    write_one(col, fc, Some(id.to_string()), cur, false).map(|mut r| {
-        r.action = "update";
-        r
-    })
-}
-
 /// Execute the Index/Create/Delete/Update ops for all collections that
 /// share a single redb Database in **one** write transaction. Update/Delete
 /// of non-existent docs and Create conflicts produce per-item errors in
@@ -1069,7 +907,7 @@ fn bulk_write_one_db(
         source: serde_json::Value,
         compressed: Vec<u8>,
         require_create: bool,
-        is_create: bool,
+        force_version: Option<u64>,
         error: Option<Error>,
     }
     // Flat list of (orig_idx, coll_index, op_kind, prep).
@@ -1084,14 +922,14 @@ fn bulk_write_one_db(
     for (ci, (col, group, _cname)) in cols.iter().enumerate() {
         for (orig, op) in group {
             let kind = match &op.kind {
-                BulkKind::Index { id, source } => BulkKind::Index { id: id.clone(), source: source.clone() },
-                BulkKind::Create { id, source } => BulkKind::Create { id: id.clone(), source: source.clone() },
+                BulkKind::Index { id, source, force_version } => BulkKind::Index { id: id.clone(), source: source.clone(), force_version: *force_version },
+                BulkKind::Create { id, source, force_version } => BulkKind::Create { id: id.clone(), source: source.clone(), force_version: *force_version },
                 BulkKind::Delete { id } => BulkKind::Delete { id: id.clone() },
                 BulkKind::Update { id, doc } => BulkKind::Update { id: id.clone(), doc: doc.clone() },
                 BulkKind::Script { id, mutator } => BulkKind::Script { id: id.clone(), mutator: mutator.clone() },
             };
             let prep = match &op.kind {
-                BulkKind::Index { id: idx_id, source } => {
+                BulkKind::Index { id: idx_id, source, force_version } => {
                     if !matches!(source, serde_json::Value::Object(_)) {
                         Some(Prep { error: Some(Error::BadRequest("source must be a JSON object".into())), ..Default::default() })
                     } else {
@@ -1109,14 +947,14 @@ fn bulk_write_one_db(
                                 source: source.clone(),
                                 compressed,
                                 require_create: false,
-                                is_create: false,
+                                force_version: *force_version,
                                 error: None,
                             }),
                             Err(e) => Some(Prep { error: Some(e), ..Default::default() }),
                         }
                     }
                 }
-                BulkKind::Create { id: cre_id, source } => {
+                BulkKind::Create { id: cre_id, source, force_version } => {
                     if !matches!(source, serde_json::Value::Object(_)) {
                         Some(Prep { error: Some(Error::BadRequest("source must be a JSON object".into())), ..Default::default() })
                     } else {
@@ -1134,7 +972,7 @@ fn bulk_write_one_db(
                                 source: source.clone(),
                                 compressed,
                                 require_create: true,
-                                is_create: true,
+                                force_version: *force_version,
                                 error: None,
                             }),
                             Err(e) => Some(Prep { error: Some(e), ..Default::default() }),
@@ -1207,7 +1045,7 @@ fn bulk_write_one_db(
                     continue;
                 }
                 let id = prep.id.clone().unwrap_or_else(uuid_like);
-                match write_doc_in_tx(&w, t, &id, &prep.compressed, prep.require_create) {
+                match write_doc_in_tx(&w, t, &id, &prep.compressed, prep.require_create, prep.force_version) {
                     Ok((row_id, created, version, fresh)) => tx_results.push(Ok(TxRes { row_id, created, version, id, fresh })),
                     Err(e) => tx_results.push(Err(e)),
                 }
@@ -1246,7 +1084,7 @@ fn bulk_write_one_db(
                 }
                 let bytes = match serde_json::to_vec(&cur) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
                 let compressed = match codec::compress(&bytes, col.storage_cfg.zstd_level) { Ok(c) => c, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } };
-                match write_doc_in_tx(&w, t, id, &compressed, false) {
+                match write_doc_in_tx(&w, t, id, &compressed, false, None) {
                     Ok((row_id, _created, version, _fresh)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone(), fresh: false })),
                     Err(e) => tx_results.push(Err(e)),
                 }
@@ -1275,7 +1113,7 @@ fn bulk_write_one_db(
                 }
                 let bytes = match serde_json::to_vec(&cur) { Ok(b) => b, Err(e) => { tx_results.push(Err(Error::from(e))); continue; } };
                 let compressed = match codec::compress(&bytes, col.storage_cfg.zstd_level) { Ok(c) => c, Err(e) => { tx_results.push(Err(Error::Io(e))); continue; } };
-                match write_doc_in_tx(&w, t, id, &compressed, false) {
+                match write_doc_in_tx(&w, t, id, &compressed, false, None) {
                     Ok((row_id, _created, version, _fresh)) => tx_results.push(Ok(TxRes { row_id, created: false, version, id: id.clone(), fresh: false })),
                     Err(e) => tx_results.push(Err(e)),
                 }
