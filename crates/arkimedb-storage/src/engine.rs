@@ -227,6 +227,15 @@ impl Collection {
 
     fn hydrate_index(&self) -> Result<()> {
         // Rebuild in-memory posting lists and field catalog from persisted docs.
+        // Per-row decompress + JSON parse is the dominant CPU cost and runs in
+        // parallel chunks. The actual index_one is run sequentially against the
+        // schema + PostingsIndex because PostingsIndex.insert takes several
+        // global write locks per call — parallelizing that step is a net loss
+        // until the postings index supports per-field/sharded locking.
+        // Chunking caps peak memory at ~CHUNK decompressed JSON values.
+        use rayon::prelude::*;
+        const CHUNK: usize = 4096;
+
         let r = self.db.begin_read()?;
         let docs = r.open_table(self.tables.docs)?;
         let tomb = r.open_table(self.tables.tombstones)?;
@@ -238,14 +247,34 @@ impl Collection {
         *self.tombstones.write() = tomb_bm.clone();
 
         let mut schema_guard = self.schema.write();
+        let mut buf: Vec<(u32, Vec<u8>)> = Vec::with_capacity(CHUNK);
+        let flush = |buf: &mut Vec<(u32, Vec<u8>)>, schema: &mut CollectionSchema| -> Result<()> {
+            if buf.is_empty() { return Ok(()); }
+            let parsed: Vec<Result<(u32, serde_json::Value)>> = buf
+                .par_iter()
+                .map(|(rid, bytes)| {
+                    let plain = codec::decompress(bytes)?;
+                    let v: serde_json::Value = serde_json::from_slice(&plain)?;
+                    Ok((*rid, v))
+                })
+                .collect();
+            for r in parsed {
+                let (rid, v) = r?;
+                index_one(&self.index, schema, rid, &v);
+            }
+            buf.clear();
+            Ok(())
+        };
         for row in docs.iter()? {
             let (k, v) = row?;
             let row_id = k.value();
             if tomb_bm.contains(row_id) { continue; }
-            let bytes = codec::decompress(v.value())?;
-            let json: serde_json::Value = serde_json::from_slice(&bytes)?;
-            index_one(&self.index, &mut *schema_guard, row_id, &json);
+            buf.push((row_id, v.value().to_vec()));
+            if buf.len() >= CHUNK {
+                flush(&mut buf, &mut schema_guard)?;
+            }
         }
+        flush(&mut buf, &mut schema_guard)?;
         Ok(())
     }
 }
