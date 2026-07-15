@@ -119,6 +119,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/_count",                        post(count_all).get(count_all))
         .route("/_aliases",                      post(update_aliases))
         .route("/_search/scroll",                post(scroll_continue).get(scroll_continue_get).delete(scroll_delete))
+        // legacy path form: scroll_id in the URL (elasticsearch-js .scroll()/.clearScroll())
+        .route("/_search/scroll/:scroll_id",     get(scroll_continue_get_path).post(scroll_continue_get_path).delete(scroll_delete_path))
         // index templates (legacy _template)
         .route("/_template",                     get(template_list))
         .route("/_template/:names",              get(template_get).head(template_head).put(template_put).post(template_put).delete(template_delete))
@@ -1642,6 +1644,26 @@ async fn scroll_continue_get(State(s): State<Arc<AppState>>, Query(qs): Query<Sc
         None => return err(StatusCode::BAD_REQUEST, "missing scroll_id"),
     };
     scroll_continue_impl(s, scroll_id, ttl_override, as_int).await
+}
+
+// Legacy form where the scroll_id is a URL path segment, e.g.
+//   GET /_search/scroll/<scroll_id>?scroll=5m
+// This is what elasticsearch-js .scroll({ scroll_id }) emits.
+async fn scroll_continue_get_path(State(s): State<Arc<AppState>>, Path(scroll_id): Path<String>, Query(qs): Query<ScrollQ>) -> Response {
+    let as_int = qs.rest_total_hits_as_int.unwrap_or(false);
+    let (_, ttl_override) = extract_scroll_args(&qs, None);
+    scroll_continue_impl(s, scroll_id, ttl_override, as_int).await
+}
+
+// Legacy form: DELETE /_search/scroll/<scroll_id> (or /_all to clear everything).
+async fn scroll_delete_path(State(s): State<Arc<AppState>>, Path(scroll_id): Path<String>) -> Response {
+    let mut g = s.scrolls.write();
+    let n = if scroll_id == "_all" {
+        let n = g.len();
+        g.clear();
+        n
+    } else if g.remove(&scroll_id).is_some() { 1 } else { 0 };
+    Json(json!({ "succeeded": true, "num_freed": n })).into_response()
 }
 
 #[derive(Deserialize, Default)]
