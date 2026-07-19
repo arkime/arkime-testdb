@@ -20,7 +20,9 @@ pub enum AggKind {
     Min   { field: String },
     Max   { field: String },
     Avg   { field: String },
-    Terms { field: String, size: usize, min_doc_count: u64 },
+    // order: (key, ascending) where key is "_count", "_key", or a metric
+    // sub-agg name; None = ES default (_count desc)
+    Terms { field: String, size: usize, min_doc_count: u64, order: Option<(String, bool)> },
     TermsIpPort { ip_field: String, port_field: String, size: usize, sep: String },
     TermsAllIp { size: usize },
     Histogram     { field: String, interval: f64 },
@@ -155,7 +157,12 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
                 let f = field_of(v)?;
                 let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(10) as usize;
                 let mdc  = v.get("min_doc_count").and_then(|x| x.as_u64()).unwrap_or(1);
-                AggKind::Terms { field: f, size, min_doc_count: mdc }
+                let order = v.get("order").and_then(|o| o.as_object()).and_then(|m| {
+                    m.iter().next().map(|(k, dir)| {
+                        (k.clone(), dir.as_str().map(|s| s.eq_ignore_ascii_case("asc")).unwrap_or(false))
+                    })
+                });
+                AggKind::Terms { field: f, size, min_doc_count: mdc, order }
             }
             "histogram" => {
                 let f = field_of(v)?;
@@ -260,7 +267,7 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                 _ => unreachable!(),
             }))
         }
-        AggKind::Terms { field, size, min_doc_count } => {
+        AggKind::Terms { field, size, min_doc_count, order } => {
             // Merge term counts across all collections. Keep per-collection
             // bitmaps separate so sub-aggs see the right row set and so that
             // row-ID collisions across collections don't collapse counts.
@@ -284,18 +291,56 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                     }
                 });
             }
-            // Count desc, tiebreak by encoded key asc (ES default ordering).
-            merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
+            let subs_sets_of = |per_col: &Vec<(Arc<Collection>, roaring::RoaringBitmap)>| -> Vec<(Arc<Collection>, roaring::RoaringBitmap)> {
+                sets.iter().map(|(c, _)| {
+                    let mut acc = roaring::RoaringBitmap::new();
+                    for (cc, bb) in per_col { if Arc::ptr_eq(cc, c) { acc |= bb; } }
+                    (c.clone(), acc)
+                }).collect()
+            };
+            // Rank candidates BEFORE truncating to size. ES default is count
+            // desc with encoded-key asc tiebreak; `order` may name _count,
+            // _key, or a metric sub-agg (computed for every candidate).
+            match order.as_ref().map(|(k, asc)| (k.as_str(), *asc)) {
+                None | Some(("_count", false)) => {
+                    merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
+                }
+                Some(("_count", true)) => {
+                    merged.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)));
+                }
+                Some(("_key", asc)) => {
+                    merged.sort_by(|a, b| if asc { a.3.cmp(&b.3) } else { b.3.cmp(&a.3) });
+                }
+                Some((sub_name, asc)) => {
+                    let Some(sub) = spec.subs.iter().find(|s| s.name == sub_name) else {
+                        return Err(Error::BadRequest(format!("terms order references unknown agg: {sub_name}")));
+                    };
+                    let mut vals: Vec<f64> = Vec::with_capacity(merged.len());
+                    for (_, _, per_col, _) in &merged {
+                        let v = match run_one(&subs_sets_of(per_col), sub)? {
+                            AggResult::Metric(v) => v.unwrap_or(f64::NEG_INFINITY),
+                            AggResult::Long(n) | AggResult::Cardinality(n) => n as f64,
+                            _ => return Err(Error::BadRequest(format!("terms order agg is not a metric: {sub_name}"))),
+                        };
+                        vals.push(v);
+                    }
+                    let mut idx: Vec<usize> = (0..merged.len()).collect();
+                    idx.sort_by(|&a, &b| {
+                        let ord = if asc { vals[a].total_cmp(&vals[b]) } else { vals[b].total_cmp(&vals[a]) };
+                        ord.then_with(|| merged[a].3.cmp(&merged[b].3))
+                    });
+                    let mut reordered = Vec::with_capacity(merged.len());
+                    let mut taken: Vec<Option<_>> = merged.into_iter().map(Some).collect();
+                    for i in idx { reordered.push(taken[i].take().unwrap()); }
+                    merged = reordered;
+                }
+            }
             let total: u64 = merged.iter().map(|m| m.1).sum();
             let mut kept: u64 = 0;
             let mut buckets = Vec::new();
             for (s, n, per_col, _) in merged.into_iter().take(*size) {
                 if n < *min_doc_count { continue; }
-                let subs_sets: Vec<(Arc<Collection>, roaring::RoaringBitmap)> = sets.iter().map(|(c, _)| {
-                    let mut acc = roaring::RoaringBitmap::new();
-                    for (cc, bb) in &per_col { if Arc::ptr_eq(cc, c) { acc |= bb; } }
-                    (c.clone(), acc)
-                }).collect();
+                let subs_sets = subs_sets_of(&per_col);
                 let mut sub_out = AHashMap::new();
                 for sub in &spec.subs { sub_out.insert(sub.name.clone(), run_one(&subs_sets, sub)?); }
                 kept += n;
