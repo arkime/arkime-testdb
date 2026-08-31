@@ -521,13 +521,60 @@ fn sort_dedup_field_values(arr: &mut Vec<J>) {
 }
 
 fn apply_source_filter(src: &mut J, spec: &J) {
-    // minimal: _source:false → null; _source:["a","b"] → keep those
+    // _source:false → null; _source:true → keep all;
+    // _source:"a.b" or ["a","a.b",...] → keep those paths (ES dot-notation:
+    // "a" keeps the whole a subtree, "a.b" keeps only a.b, descending into
+    // arrays of objects); {"includes":[...]} form is also accepted.
     match spec {
         J::Bool(false) => { *src = J::Null; }
+        J::Bool(true) => {}
+        J::String(s) => {
+            apply_source_filter(src, &J::Array(vec![J::String(s.clone())]));
+        }
         J::Array(list) => {
-            if let J::Object(map) = src {
-                let keep: ahash::AHashSet<String> = list.iter().filter_map(|v| v.as_str().map(String::from)).collect();
-                map.retain(|k, _| keep.contains(k));
+            let paths: Vec<Vec<&str>> = list.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split('.').collect())
+                .collect();
+            if paths.is_empty() { return; }
+            let mut out = J::Object(serde_json::Map::new());
+            for p in &paths { project_source_path(src, p, &mut out); }
+            *src = out;
+        }
+        J::Object(o) => {
+            if let Some(inc) = o.get("includes") { apply_source_filter(src, inc); }
+        }
+        _ => {}
+    }
+}
+
+/// Copy the value(s) at dotted `path` from `src` into `out`, creating
+/// intermediate objects and merging with anything already projected.
+/// Mirrors ES `_source` include semantics, including descent into arrays of
+/// objects (e.g. `dns.answers.ip` projects `ip` from each answer).
+fn project_source_path(src: &J, path: &[&str], out: &mut J) {
+    if path.is_empty() { return; }
+    match src {
+        J::Object(smap) => {
+            let key = path[0];
+            let Some(sval) = smap.get(key) else { return; };
+            let J::Object(omap) = out else { return; };
+            if path.len() == 1 {
+                omap.insert(key.to_string(), sval.clone());
+            } else {
+                let entry = omap.entry(key.to_string()).or_insert_with(||
+                    if sval.is_array() { J::Array(Vec::new()) } else { J::Object(serde_json::Map::new()) });
+                project_source_path(sval, &path[1..], entry);
+            }
+        }
+        J::Array(sarr) => {
+            let J::Array(oarr) = out else { return; };
+            if oarr.len() < sarr.len() {
+                oarr.resize(sarr.len(), J::Object(serde_json::Map::new()));
+            }
+            for (i, sel) in sarr.iter().enumerate() {
+                project_source_path(sel, path, &mut oarr[i]);
             }
         }
         _ => {}
