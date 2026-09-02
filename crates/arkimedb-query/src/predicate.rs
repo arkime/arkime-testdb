@@ -353,6 +353,32 @@ pub fn compile_es_query(j: &J, col: &Arc<Collection>) -> Result<Query> {
                 return Ok(Query::Ids(ids));
             }
             let ft = col.index.field_type(&field).unwrap_or(FieldType::Keyword);
+            if ft == FieldType::Ip {
+                // Like `term` on an ip field, each value may be a CIDR ("10/8")
+                // as well as an exact address; ES matches any. Build a should
+                // over Cidr / Term (pure-should min=0 behaves as OR here).
+                let mut should: Vec<Query> = Vec::new();
+                let mut exact: Vec<Scalar> = Vec::new();
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        if s.contains('/') {
+                            if let Some((net, prefix)) = parse_cidr(s) {
+                                should.push(Query::Cidr { field: field.clone(), net, prefix });
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(scal) = arkimedb_core::value::coerce(v, ft) { exact.push(scal); }
+                }
+                if !exact.is_empty() {
+                    should.push(Query::Term { field: field.clone(), values: exact });
+                }
+                return Ok(match should.len() {
+                    0 => Query::MatchNone,
+                    1 => should.into_iter().next().unwrap(),
+                    _ => Query::Bool { must: vec![], should, must_not: vec![], filter: vec![], min_should_match: 0 },
+                });
+            }
             let scalars: Vec<Scalar> = arr.iter().filter_map(|v| arkimedb_core::value::coerce(v, ft)).collect();
             Ok(Query::Term { field, values: scalars })
         }
