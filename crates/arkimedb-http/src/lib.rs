@@ -397,6 +397,12 @@ fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<bool, 
     })
 }
 
+// Same as de_flag for an optional param, so ?rest_total_hits_as_int works like ES.
+fn de_opt_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<bool>, D::Error> {
+    let s: Option<String> = Option::deserialize(d)?;
+    Ok(s.map(|s| matches!(s.as_str(), "" | "true" | "1" | "yes")))
+}
+
 async fn cat_index() -> Response {
     // Matches Elasticsearch's /_cat help text.
     let body = "=^.^=\n\
@@ -1394,9 +1400,11 @@ struct SearchQ {
     scroll: Option<String>,
     size: Option<usize>,
     from: Option<usize>,
+    #[serde(default, deserialize_with = "de_opt_flag")]
     rest_total_hits_as_int: Option<bool>,
     q: Option<String>,
     sort: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_flag")]
     version: Option<bool>,
 }
 
@@ -1668,7 +1676,12 @@ async fn scroll_delete_path(State(s): State<Arc<AppState>>, Path(scroll_id): Pat
 
 #[derive(Deserialize, Default)]
 #[allow(dead_code)]
-struct ScrollQ { scroll: Option<String>, scroll_id: Option<String>, rest_total_hits_as_int: Option<bool> }
+struct ScrollQ {
+    scroll: Option<String>,
+    scroll_id: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_flag")]
+    rest_total_hits_as_int: Option<bool>,
+}
 
 fn extract_scroll_args(qs: &ScrollQ, body: Option<&J>) -> (Option<String>, Option<std::time::Duration>) {
     let id = qs.scroll_id.clone().or_else(|| {
@@ -1777,7 +1790,10 @@ fn prune_expired_scrolls(g: &mut ahash::AHashMap<String, ScrollState>) {
 
 #[derive(Deserialize, Default)]
 #[allow(dead_code)]
-struct MSearchQ { rest_total_hits_as_int: Option<bool> }
+struct MSearchQ {
+    #[serde(default, deserialize_with = "de_opt_flag")]
+    rest_total_hits_as_int: Option<bool>,
+}
 
 async fn msearch(headers: HeaderMap, Query(q): Query<MSearchQ>, State(s): State<Arc<AppState>>, body: String) -> Response {
     msearch_impl(headers, None, q, s, body).await
