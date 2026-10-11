@@ -200,7 +200,23 @@ fn parse_interval_ms(s: &str) -> Result<i64> {
     Ok(n * mul)
 }
 
+// ES refuses terms aggs on text fields (no fielddata); match it so clients see the same error.
+fn reject_text_terms(cols: &[Arc<Collection>], specs: &[AggRequest]) -> Result<()> {
+    for spec in specs {
+        if let AggKind::Terms { field, .. } = &spec.kind {
+            if cols.iter().any(|c| c.schema.read().fields.get(field) == Some(&FieldType::Text)) {
+                return Err(Error::BadRequest(format!(
+                    "Text fields are not optimised for operations that require per-document field data like aggregations and sorting, so these operations are disabled by default. Please use a keyword field instead. Alternatively, set fielddata=true on [{field}] in order to load field data by uninverting the inverted index. Note that this can use significant memory."
+                )));
+            }
+        }
+        reject_text_terms(cols, &spec.subs)?;
+    }
+    Ok(())
+}
+
 pub fn run_aggs(cols: &[Arc<Collection>], query_json: &J, specs: &[AggRequest]) -> Result<AggResult> {
+    reject_text_terms(cols, specs)?;
     // Compute the matching row bitmap per collection, once.
     let mut sets: Vec<(Arc<Collection>, roaring::RoaringBitmap)> = Vec::with_capacity(cols.len());
     for col in cols {
