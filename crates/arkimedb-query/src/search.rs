@@ -524,7 +524,8 @@ fn apply_source_filter(src: &mut J, spec: &J) {
     // _source:false → null; _source:true → keep all;
     // _source:"a.b" or ["a","a.b",...] → keep those paths (ES dot-notation:
     // "a" keeps the whole a subtree, "a.b" keeps only a.b, descending into
-    // arrays of objects); {"includes":[...]} form is also accepted.
+    // arrays of objects); {"includes":[...],"excludes":[...]} form is also
+    // accepted, excludes applied after includes like ES.
     match spec {
         J::Bool(false) => { *src = J::Null; }
         J::Bool(true) => {}
@@ -544,8 +545,84 @@ fn apply_source_filter(src: &mut J, spec: &J) {
         }
         J::Object(o) => {
             if let Some(inc) = o.get("includes") { apply_source_filter(src, inc); }
+            let excludes: Vec<&str> = match o.get("excludes") {
+                Some(J::String(s)) => vec![s.as_str()],
+                Some(J::Array(list)) => list.iter().filter_map(|v| v.as_str()).collect(),
+                _ => Vec::new(),
+            };
+            if !excludes.is_empty() { *src = filter_source(src, &[], &excludes); }
         }
         _ => {}
+    }
+}
+
+/// ES `_source` includes/excludes: patterns match the full dotted path and
+/// everything under it (so literal dotted keys match too), `*` matches
+/// anything, excludes win.
+pub fn filter_source(src: &J, includes: &[&str], excludes: &[&str]) -> J {
+    let includes: Vec<&str> = includes.iter().copied().filter(|s| !s.is_empty()).collect();
+    let excludes: Vec<&str> = excludes.iter().copied().filter(|s| !s.is_empty()).collect();
+    match src {
+        J::Object(map) => J::Object(filter_obj(map, "", &includes, &excludes, includes.is_empty())),
+        _ => src.clone(),
+    }
+}
+
+fn filter_obj(map: &serde_json::Map<String, J>, path: &str, inc: &[&str], exc: &[&str], all: bool) -> serde_json::Map<String, J> {
+    let mut out = serde_json::Map::new();
+    for (k, val) in map {
+        let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+        if exc.iter().any(|e| glob_match_path(e, &p)) { continue; }
+        let child_all = all || inc.iter().any(|i| glob_match_path(i, &p));
+        let deeper = format!("{p}.");
+        if !child_all && !inc.iter().any(|i| glob_can_extend(i, &deeper)) { continue; }
+        if child_all && !exc.iter().any(|e| glob_can_extend(e, &deeper)) {
+            out.insert(k.clone(), val.clone());
+            continue;
+        }
+        // Like ES, a filtered object or array is kept only if it matched or has something left
+        let f = match val {
+            J::Object(m) => J::Object(filter_obj(m, &p, inc, exc, child_all)),
+            J::Array(a) => J::Array(filter_arr(a, &p, inc, exc, child_all)),
+            _ => val.clone(),
+        };
+        let keep = match &f {
+            J::Object(m) => child_all || !m.is_empty(),
+            J::Array(a) => child_all || !a.is_empty(),
+            _ => child_all,
+        };
+        if keep { out.insert(k.clone(), f); }
+    }
+    out
+}
+
+// Like ES, objects and arrays left empty by filtering are dropped from arrays
+fn filter_arr(arr: &[J], path: &str, inc: &[&str], exc: &[&str], all: bool) -> Vec<J> {
+    let mut out = Vec::new();
+    for v in arr {
+        match v {
+            J::Object(m) => { let f = filter_obj(m, path, inc, exc, all); if !f.is_empty() { out.push(J::Object(f)); } }
+            J::Array(a) => { let f = filter_arr(a, path, inc, exc, all); if !f.is_empty() { out.push(J::Array(f)); } }
+            _ => if all { out.push(v.clone()); },
+        }
+    }
+    out
+}
+
+// The pattern matches the path itself or any parent of it
+fn glob_match_path(p: &str, path: &str) -> bool {
+    glob_match(p, path) || path.match_indices('.').any(|(i, _)| glob_match(p, &path[..i]))
+}
+
+// Could `p` match some string that starts with `prefix`?
+fn glob_can_extend(p: &str, prefix: &str) -> bool {
+    match p.split_once('*') {
+        None => p.starts_with(prefix),
+        Some((head, rest)) => {
+            if prefix.len() <= head.len() { return head.starts_with(prefix); }
+            let Some(s) = prefix.strip_prefix(head) else { return false; };
+            (0..=s.len()).filter(|&i| s.is_char_boundary(i)).any(|i| glob_can_extend(rest, &s[i..]))
+        }
     }
 }
 
