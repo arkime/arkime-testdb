@@ -17,7 +17,7 @@ use serde_json::{json, Value as J};
 
 use arkimedb_core::{Error, Result};
 use arkimedb_storage::{Engine, engine::{BulkOp, BulkKind, BulkOutcome}};
-use arkimedb_query::{SearchRequest, search::execute as run_search};
+use arkimedb_query::{SearchRequest, search::{execute as run_search, apply_source_filter}};
 
 pub struct AppState {
     pub engine: Arc<Engine>,
@@ -1098,7 +1098,37 @@ async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J)
     }
 }
 
-async fn get_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>) -> Response {
+// _source, _source_includes and _source_excludes on a single doc get, like ES
+#[derive(Deserialize, Default)]
+struct GetSourceQ {
+    #[serde(rename = "_source")]
+    source: Option<String>,
+    #[serde(rename = "_source_includes")]
+    source_includes: Option<String>,
+    #[serde(rename = "_source_excludes")]
+    source_excludes: Option<String>,
+}
+
+impl GetSourceQ {
+    // None means no _source at all (_source=false)
+    fn filter(&self, mut src: J) -> Option<J> {
+        let split = |s: &str| J::Array(s.split(',').map(|p| J::String(p.trim().to_string())).collect());
+        let mut includes = None;
+        match self.source.as_deref() {
+            Some("false") | Some("0") | Some("no") => return None,
+            Some("") | Some("true") | Some("1") | Some("yes") | None => {}
+            Some(list) => includes = Some(split(list)),
+        }
+        if let Some(list) = self.source_includes.as_deref() { includes = Some(split(list)); }
+        let mut spec = serde_json::Map::new();
+        if let Some(inc) = includes { spec.insert("includes".into(), inc); }
+        if let Some(list) = self.source_excludes.as_deref() { spec.insert("excludes".into(), split(list)); }
+        if !spec.is_empty() { apply_source_filter(&mut src, &J::Object(spec)); }
+        Some(src)
+    }
+}
+
+async fn get_doc(Path((idx, id)): Path<(String, String)>, Query(q): Query<GetSourceQ>, State(s): State<Arc<AppState>>) -> Response {
     let col = match s.engine.resolve(&idx).ok().and_then(|v| v.into_iter().next()) {
         Some(c) => c,
         None => return not_found(&idx, &id),
@@ -1106,17 +1136,19 @@ async fn get_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<Ap
     match col.get_by_id(&id) {
         Ok(Some((_, version, raw))) => {
             let src: J = serde_json::from_slice(&raw).unwrap_or(J::Null);
-            Json(json!({
+            let mut body = json!({
                 "_index": &col.name, "_id": id,
-                "_version": version, "found": true, "_source": src
-            })).into_response()
+                "_version": version, "found": true
+            });
+            if let Some(src) = q.filter(src) { body["_source"] = src; }
+            Json(body).into_response()
         }
         Ok(None) => not_found(&col.name, &id),
         Err(e) => internal(e),
     }
 }
 
-async fn get_source(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>) -> Response {
+async fn get_source(Path((idx, id)): Path<(String, String)>, Query(q): Query<GetSourceQ>, State(s): State<Arc<AppState>>) -> Response {
     let col = match s.engine.resolve(&idx).ok().and_then(|v| v.into_iter().next()) {
         Some(c) => c,
         None => return not_found(&idx, &id),
@@ -1124,7 +1156,7 @@ async fn get_source(Path((idx, id)): Path<(String, String)>, State(s): State<Arc
     match col.get_by_id(&id) {
         Ok(Some((_, _version, raw))) => {
             let src: J = serde_json::from_slice(&raw).unwrap_or(J::Null);
-            Json(src).into_response()
+            Json(q.filter(src).unwrap_or(J::Null)).into_response()
         }
         Ok(None) => not_found(&col.name, &id),
         Err(e) => internal(e),

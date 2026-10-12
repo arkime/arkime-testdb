@@ -520,11 +520,12 @@ fn sort_dedup_field_values(arr: &mut Vec<J>) {
     }
 }
 
-fn apply_source_filter(src: &mut J, spec: &J) {
+pub fn apply_source_filter(src: &mut J, spec: &J) {
     // _source:false → null; _source:true → keep all;
     // _source:"a.b" or ["a","a.b",...] → keep those paths (ES dot-notation:
     // "a" keeps the whole a subtree, "a.b" keeps only a.b, descending into
-    // arrays of objects); {"includes":[...]} form is also accepted.
+    // arrays of objects); {"includes":[...],"excludes":[...]} form is also
+    // accepted, excludes applied after includes like ES.
     match spec {
         J::Bool(false) => { *src = J::Null; }
         J::Bool(true) => {}
@@ -544,6 +545,34 @@ fn apply_source_filter(src: &mut J, spec: &J) {
         }
         J::Object(o) => {
             if let Some(inc) = o.get("includes") { apply_source_filter(src, inc); }
+            let excludes = match o.get("excludes") {
+                Some(J::String(s)) => vec![s.as_str()],
+                Some(J::Array(list)) => list.iter().filter_map(|v| v.as_str()).collect(),
+                _ => Vec::new(),
+            };
+            for e in excludes.into_iter().filter(|s| !s.is_empty()) {
+                let path: Vec<&str> = e.split('.').collect();
+                remove_source_path(src, &path);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remove the value(s) at dotted `path` from `src`, descending into arrays
+/// of objects like `project_source_path`.
+fn remove_source_path(src: &mut J, path: &[&str]) {
+    if path.is_empty() { return; }
+    match src {
+        J::Object(smap) => {
+            if path.len() == 1 {
+                smap.remove(path[0]);
+            } else if let Some(sval) = smap.get_mut(path[0]) {
+                remove_source_path(sval, &path[1..]);
+            }
+        }
+        J::Array(sarr) => {
+            for sel in sarr.iter_mut() { remove_source_path(sel, path); }
         }
         _ => {}
     }
