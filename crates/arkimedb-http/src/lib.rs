@@ -17,7 +17,7 @@ use serde_json::{json, Value as J};
 
 use arkimedb_core::{Error, Result};
 use arkimedb_storage::{Engine, engine::{BulkOp, BulkKind, BulkOutcome}};
-use arkimedb_query::{SearchRequest, search::{execute as run_search, apply_source_filter}};
+use arkimedb_query::{SearchRequest, search::{execute as run_search, filter_source}};
 
 pub struct AppState {
     pub engine: Arc<Engine>,
@@ -1098,33 +1098,47 @@ async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J)
     }
 }
 
-// _source, _source_includes and _source_excludes on a single doc get, like ES
-#[derive(Deserialize, Default)]
+// _source, _source_includes and _source_excludes on a single doc get, like ES:
+// only true/false are flags, anything else is a field list, last value wins
+#[derive(Default)]
 struct GetSourceQ {
-    #[serde(rename = "_source")]
     source: Option<String>,
-    #[serde(rename = "_source_includes")]
     source_includes: Option<String>,
-    #[serde(rename = "_source_excludes")]
     source_excludes: Option<String>,
 }
 
-impl GetSourceQ {
-    // None means no _source at all (_source=false)
-    fn filter(&self, mut src: J) -> Option<J> {
-        let split = |s: &str| J::Array(s.split(',').map(|p| J::String(p.trim().to_string())).collect());
-        let mut includes = None;
-        match self.source.as_deref() {
-            Some("false") | Some("0") | Some("no") => return None,
-            Some("") | Some("true") | Some("1") | Some("yes") | None => {}
-            Some(list) => includes = Some(split(list)),
+impl<'de> Deserialize<'de> for GetSourceQ {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let mut q = GetSourceQ::default();
+        for (k, v) in Vec::<(String, String)>::deserialize(d)? {
+            match k.as_str() {
+                "_source" => q.source = Some(v),
+                "_source_includes" => q.source_includes = Some(v),
+                "_source_excludes" => q.source_excludes = Some(v),
+                _ => {}
+            }
         }
-        if let Some(list) = self.source_includes.as_deref() { includes = Some(split(list)); }
-        let mut spec = serde_json::Map::new();
-        if let Some(inc) = includes { spec.insert("includes".into(), inc); }
-        if let Some(list) = self.source_excludes.as_deref() { spec.insert("excludes".into(), split(list)); }
-        if !spec.is_empty() { apply_source_filter(&mut src, &J::Object(spec)); }
-        Some(src)
+        Ok(q)
+    }
+}
+
+impl GetSourceQ {
+    fn disabled(&self) -> bool { self.source.as_deref() == Some("false") }
+
+    // None means no _source at all (_source=false)
+    fn filter(&self, src: J) -> Option<J> {
+        if self.disabled() { return None; }
+        let split = |s: &str| s.split(',').filter(|p| !p.is_empty()).map(String::from).collect::<Vec<_>>();
+        let mut includes = match self.source.as_deref() {
+            None | Some("true") => Vec::new(),
+            Some(list) => split(list),
+        };
+        if let Some(list) = self.source_includes.as_deref() { includes = split(list); }
+        let excludes = self.source_excludes.as_deref().map(split).unwrap_or_default();
+        if includes.is_empty() && excludes.is_empty() { return Some(src); }
+        let inc: Vec<&str> = includes.iter().map(String::as_str).collect();
+        let exc: Vec<&str> = excludes.iter().map(String::as_str).collect();
+        Some(filter_source(&src, &inc, &exc))
     }
 }
 
@@ -1149,6 +1163,9 @@ async fn get_doc(Path((idx, id)): Path<(String, String)>, Query(q): Query<GetSou
 }
 
 async fn get_source(Path((idx, id)): Path<(String, String)>, Query(q): Query<GetSourceQ>, State(s): State<Arc<AppState>>) -> Response {
+    if q.disabled() {
+        return err(StatusCode::BAD_REQUEST, "Validation Failed: 1: fetching source can not be disabled;");
+    }
     let col = match s.engine.resolve(&idx).ok().and_then(|v| v.into_iter().next()) {
         Some(c) => c,
         None => return not_found(&idx, &id),
