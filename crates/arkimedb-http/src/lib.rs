@@ -150,10 +150,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/:idx/_update/:id",              post(update_doc))
         .route("/_mget",                         post(mget).get(mget))
         .route("/:idx/_mget",                    post(mget_scoped).get(mget_scoped))
+        .fallback(no_handler)
         .layer(middleware::from_fn(log_requests))
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(state)
+}
+
+// ES answers an unknown url with a 400, not a 404. Clients tell a missing doc or
+// index (404) from a wrong url by that, esProxy exits on it at startup.
+async fn no_handler(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    let uri = uri.path_and_query().map_or("/", |p| p.as_str());
+    (StatusCode::BAD_REQUEST, Json(json!({
+        "error": format!("no handler found for uri [{uri}] and method [{method}]")
+    }))).into_response()
 }
 
 async fn log_requests(req: Request<axum::body::Body>, next: Next) -> Response {
@@ -1192,11 +1202,11 @@ async fn head_source(Path((idx, id)): Path<(String, String)>, State(s): State<Ar
     }
 }
 
-async fn mget(State(s): State<Arc<AppState>>, body: String) -> Response {
-    do_mget(&s, None, body).await
+async fn mget(Query(q): Query<GetSourceQ>, State(s): State<Arc<AppState>>, body: String) -> Response {
+    do_mget(&s, None, &q, body).await
 }
-async fn mget_scoped(Path(idx): Path<String>, State(s): State<Arc<AppState>>, body: String) -> Response {
-    do_mget(&s, Some(idx), body).await
+async fn mget_scoped(Path(idx): Path<String>, Query(q): Query<GetSourceQ>, State(s): State<Arc<AppState>>, body: String) -> Response {
+    do_mget(&s, Some(idx), &q, body).await
 }
 
 /// ES `_mget`: batch-fetch documents by `_id`. Accepts both shapes:
@@ -1204,8 +1214,8 @@ async fn mget_scoped(Path(idx): Path<String>, State(s): State<Arc<AppState>>, bo
 ///   { "ids":  ["1","2"] }   (when scoped to a single index in the URL)
 /// Each result mirrors a `GET /:idx/_doc/:id` payload (with `found:false`
 /// for misses). This is what the Arkime viewer uses to load session detail
-/// in batches.
-async fn do_mget(s: &Arc<AppState>, default_idx: Option<String>, body: String) -> Response {
+/// in batches. The _source query params filter every doc like on a single get.
+async fn do_mget(s: &Arc<AppState>, default_idx: Option<String>, q: &GetSourceQ, body: String) -> Response {
     let req: J = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -1238,10 +1248,12 @@ async fn do_mget(s: &Arc<AppState>, default_idx: Option<String>, body: String) -
             Some(col) => match col.get_by_id(&id) {
                 Ok(Some((_, version, raw))) => {
                     let src: J = serde_json::from_slice(&raw).unwrap_or(J::Null);
-                    json!({
+                    let mut entry = json!({
                         "_index": &col.name, "_id": id,
-                        "_version": version, "found": true, "_source": src
-                    })
+                        "_version": version, "found": true
+                    });
+                    if let Some(src) = q.filter(src) { entry["_source"] = src; }
+                    entry
                 }
                 Ok(None) => json!({ "_index": &col.name, "_id": id, "found": false }),
                 Err(e) => json!({ "_index": &col.name, "_id": id, "found": false,
