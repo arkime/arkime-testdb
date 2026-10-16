@@ -1076,13 +1076,26 @@ async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J)
     let params = script.get("params").cloned().unwrap_or(J::Null);
     // Find the collection containing the doc.
     let cols = match s.engine.resolve(idx) { Ok(v) => v, Err(e) => return internal(e) };
-    let mut col_name: Option<String> = None;
+    let mut found: Option<(String, u64, Vec<u8>)> = None;
     for c in cols {
-        if let Ok(Some(_)) = c.get_by_id(id) { col_name = Some(c.name.clone()); break; }
+        if let Ok(Some((_, version, bytes))) = c.get_by_id(id) { found = Some((c.name.clone(), version, bytes)); break; }
     }
-    let Some(col_name) = col_name else {
+    let Some((col_name, version, doc_bytes)) = found else {
         return err(StatusCode::NOT_FOUND, &format!("document_missing: {idx}/{id}"));
     };
+    // esProxy wraps the hunt script so it sets ctx.op = 'none' unless the session's
+    // node is in params.esproxyNodes, ES then answers noop and writes nothing
+    if src_text.contains("params.esproxyNodes.contains(ctx._source.node)") {
+        let node = serde_json::from_slice::<J>(&doc_bytes).ok().and_then(|d| d.get("node").cloned());
+        let nodes = params.get("esproxyNodes").and_then(|v| v.as_array());
+        let allowed = matches!((nodes, &node), (Some(nodes), Some(node)) if nodes.contains(node));
+        if !allowed {
+            return (StatusCode::OK, Json(json!({
+                "_index": col_name, "_id": id, "_version": version, "result": "noop",
+                "_shards": { "total": 0, "successful": 0, "failed": 0 }
+            }))).into_response();
+        }
+    }
     // Build a mutator closure that captures the painless script + params,
     // and runs apply_script_mutation. This is executed inside the write
     // transaction under reindex_lock, so the whole read-modify-write is
