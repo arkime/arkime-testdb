@@ -680,9 +680,15 @@ impl Engine {
 
 // --- bulk op model --------------------------------------------------------
 
+/// ES external versioning on a write. `gte` is version_type=external_gte,
+/// otherwise external/external_gt where the version must be higher than an
+/// existing doc's.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalVersion { pub version: u64, pub gte: bool }
+
 pub enum BulkKind {
-    Index  { id: Option<String>, source: serde_json::Value, force_version: Option<u64> },
-    Create { id: String,          source: serde_json::Value, force_version: Option<u64> },
+    Index  { id: Option<String>, source: serde_json::Value, force_version: Option<ExternalVersion> },
+    Create { id: String,          source: serde_json::Value, force_version: Option<ExternalVersion> },
     Update { id: String,          doc: serde_json::Value },
     Delete { id: String },
     /// Read-modify-write under the write tx + reindex_lock (atomic like ES
@@ -842,7 +848,7 @@ fn write_doc_in_tx(
     id: &str,
     compressed: &[u8],
     require_create: bool,
-    force_version: Option<u64>,
+    force_version: Option<ExternalVersion>,
 ) -> Result<(u32, bool, u64, bool)> {
     let mut id2row = w.open_table(t.id2row)?;
     let existing = id2row.get(id)?.map(|v| v.value());
@@ -861,6 +867,17 @@ fn write_doc_in_tx(
     let (row_id, created, fresh) = match existing {
         Some(r) if !tombstoned => {
             if require_create { return Err(Error::Conflict(format!("document already exists: {id}"))); }
+            // Like ES, reject an external version that isn't newer before
+            // anything is written
+            if let Some(ev) = force_version {
+                let vt = w.open_table(t.versions)?;
+                let cur = vt.get(r)?.map(|v| v.value()).unwrap_or(0);
+                drop(vt);
+                if ev.version < cur || (!ev.gte && ev.version == cur) {
+                    let cmp = if ev.gte { "higher than" } else { "higher or equal to" };
+                    return Err(Error::Conflict(format!("[{id}]: version conflict, current version [{cur}] is {cmp} the one provided [{}]", ev.version)));
+                }
+            }
             (r, false, false)
         }
         Some(r) => {
@@ -887,12 +904,10 @@ fn write_doc_in_tx(
     }
     let version = {
         let mut vt = w.open_table(t.versions)?;
-        // External versioning: only honor force_version when the doc didn't
-        // already exist (i.e. created==true). For an update of an existing
-        // row we fall back to cur+1 — clients that want strict ES external
-        // versioning semantics on update should use a real ES.
-        let new = if let Some(v) = force_version.filter(|_| created) {
-            v
+        // External versioning stores the version given, a version that isn't
+        // newer than an existing doc's was already rejected above
+        let new = if let Some(ev) = force_version {
+            ev.version
         } else {
             let cur = vt.get(row_id)?.map(|v| v.value()).unwrap_or(0);
             cur + 1
@@ -948,7 +963,7 @@ fn bulk_write_one_db(
         source: serde_json::Value,
         compressed: Vec<u8>,
         require_create: bool,
-        force_version: Option<u64>,
+        force_version: Option<ExternalVersion>,
         error: Option<Error>,
     }
     // Flat list of (orig_idx, coll_index, op_kind, prep).

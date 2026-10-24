@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value as J};
 
 use arkimedb_core::{Error, Result};
-use arkimedb_storage::{Engine, engine::{BulkOp, BulkKind, BulkOutcome}};
+use arkimedb_storage::{Engine, engine::{BulkOp, BulkKind, BulkOutcome, ExternalVersion}};
 use arkimedb_query::{SearchRequest, search::{execute as run_search, filter_source}};
 
 pub struct AppState {
@@ -890,7 +890,18 @@ fn schema_to_mapping(sch: &arkimedb_core::CollectionSchema) -> J {
 // -------- document CRUD --------------------------------------------------
 
 #[derive(Deserialize, Default)]
-struct WriteQ { op_type: Option<String>, refresh: Option<String> }
+struct WriteQ { op_type: Option<String>, refresh: Option<String>, version_type: Option<String>, version: Option<u64> }
+
+/// ES external versioning from version_type + version, given on the url or
+/// in a bulk action line
+fn external_version(version_type: Option<&str>, version: Option<u64>) -> Option<ExternalVersion> {
+    let gte = match version_type? {
+        "external" | "external_gt" => false,
+        "external_gte" => true,
+        _ => return None,
+    };
+    version.filter(|v| *v > 0).map(|version| ExternalVersion { version, gte })
+}
 
 fn is_refresh_true(v: &Option<String>) -> bool {
     matches!(v.as_deref(), Some("true") | Some("wait_for") | Some("1") | Some(""))
@@ -913,10 +924,11 @@ async fn index_doc_auto_id(Path(idx): Path<String>, State(s): State<Arc<AppState
 }
 async fn index_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
+    let force_version = external_version(q.version_type.as_deref(), q.version);
     let kind = if q.op_type.as_deref() == Some("create") {
-        BulkKind::Create { id, source: body, force_version: None }
+        BulkKind::Create { id, source: body, force_version }
     } else {
-        BulkKind::Index { id: Some(id), source: body, force_version: None }
+        BulkKind::Index { id: Some(id), source: body, force_version }
     };
     let op = BulkOp { collection: Some(idx.clone()), kind };
     let engine = s.engine.clone();
@@ -933,7 +945,8 @@ async fn index_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<
 }
 async fn create_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc<AppState>>, Query(q): Query<WriteQ>, Json(body): Json<J>) -> Response {
     ensure_with_templates(&s, &idx);
-    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Create { id, source: body, force_version: None } };
+    let force_version = external_version(q.version_type.as_deref(), q.version);
+    let op = BulkOp { collection: Some(idx.clone()), kind: BulkKind::Create { id, source: body, force_version } };
     let engine = s.engine.clone();
     let refresh = is_refresh_true(&q.refresh);
     let idx_c = idx.clone();
@@ -1931,10 +1944,8 @@ async fn do_bulk(s: &Arc<AppState>, default_idx: Option<String>, q: BulkQ, body:
         let coll = meta.get("_index").and_then(|v| v.as_str()).map(String::from)
             .or(default_idx.clone());
         let id   = meta.get("_id").and_then(|v| v.as_str()).map(String::from);
-        let force_version = meta.get("version_type").and_then(|v| v.as_str())
-            .filter(|t| *t == "external" || *t == "external_gt" || *t == "external_gte")
-            .and_then(|_| meta.get("version").and_then(|v| v.as_u64()))
-            .filter(|v| *v > 0);
+        let force_version = external_version(meta.get("version_type").and_then(|v| v.as_str()),
+                                             meta.get("version").and_then(|v| v.as_u64()));
         let kind = match action.as_str() {
             "index" | "" => {
                 let src = match lines.next() { Some(s) => s, None => break };
