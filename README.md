@@ -70,7 +70,7 @@ Enough of ES 7.10 to make Arkime happy. Roughly:
   projection, `_source` filtering.
 - **Query DSL subset** — `bool`, `term`/`terms`, `match`, `range`,
   `query_string` / Lucene `q=`, `exists`, `prefix`, `wildcard`, `regexp`, CIDR.
-- **Aggregations** — `terms`, `date_histogram`, `cardinality`, `stats`, nested.
+- **Aggregations** — `terms`, `date_histogram`, `cardinality`, `stats`, `filter`, nested.
 - **Cluster/cat** — `/_cluster/health`, `/_nodes[/stats]`, `/_cat/*`,
   `/_ilm/policy`, `/_plugins/_ism/policies` (stubs for ILM/ISM).
 - **Version** — reports `7.10.10` so Arkime's version gate is satisfied.

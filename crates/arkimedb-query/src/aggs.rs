@@ -1,5 +1,6 @@
 //! Aggregations: count, sum/min/max/avg, cardinality, terms, histogram,
-//! date_histogram (incl. two-field span bucketing), plus nested sub-aggs.
+//! date_histogram (incl. two-field span bucketing), filter, plus nested
+//! sub-aggs.
 
 use std::sync::Arc;
 use ahash::{AHashMap, AHashSet};
@@ -27,6 +28,8 @@ pub enum AggKind {
     TermsAllIp { size: usize },
     Histogram     { field: String, interval: f64 },
     DateHistogram { field: String, interval_ms: i64, span_end_field: Option<String> },
+    // one bucket: the rows that also match an ES query clause
+    Filter { query: J },
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,7 @@ pub enum AggResult {
     Cardinality(u64),
     Buckets(Vec<Bucket>),
     TermsBuckets { buckets: Vec<Bucket>, sum_other_doc_count: u64 },
+    SingleBucket { doc_count: u64, subs: AHashMap<String, AggResult> },
     Multi(AHashMap<String, AggResult>),
 }
 
@@ -104,6 +108,13 @@ impl AggResult {
                     "sum_other_doc_count": sum_other_doc_count,
                     "buckets": buckets,
                 })
+            }
+            AggResult::SingleBucket { doc_count, subs } => {
+                // ES puts a single bucket agg's sub-aggs beside its doc_count
+                let mut o = serde_json::Map::new();
+                o.insert("doc_count".into(), J::Number(doc_count.into()));
+                for (k, v) in subs { o.insert(k, v.into_json()); }
+                J::Object(o)
             }
         }
     }
@@ -177,6 +188,7 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
                 let end_field = v.get("span_end_field").and_then(|x| x.as_str()).map(String::from);
                 AggKind::DateHistogram { field: f, interval_ms: ms, span_end_field: end_field }
             }
+            "filter" => AggKind::Filter { query: v.clone() },
             _ => continue,
         });
     }
@@ -632,6 +644,19 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                 });
             }
             Ok(AggResult::Buckets(buckets))
+        }
+        AggKind::Filter { query } => {
+            // the clause compiles per collection, like the search query does
+            let mut filtered = Vec::with_capacity(sets.len());
+            let mut doc_count = 0u64;
+            for (col, bm) in sets {
+                let hits = compile_es_query(query, col)?.eval(col)? & bm;
+                doc_count += hits.len();
+                filtered.push((col.clone(), hits));
+            }
+            let mut subs = AHashMap::new();
+            for sub in &spec.subs { subs.insert(sub.name.clone(), run_one(&filtered, sub)?); }
+            Ok(AggResult::SingleBucket { doc_count, subs })
         }
     }
 }
