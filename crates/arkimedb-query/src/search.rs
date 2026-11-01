@@ -265,10 +265,7 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
             for (col, bm, map, _min, _max) in per_col_info.iter() {
                 let mut local: Vec<(u32, Option<arkimedb_core::Scalar>)> = bm.iter()
                     .map(|r| (r, map.get(&r).cloned())).collect();
-                local.sort_by(|a, b| {
-                    let ord = cmp_scalar_opt(a.1.as_ref(), b.1.as_ref(), ss.missing_last);
-                    if ss.ascending { ord } else { ord.reverse() }
-                });
+                local.sort_by(|a, b| cmp_scalar_opt(a.1.as_ref(), b.1.as_ref(), ss.missing_last, ss.ascending));
                 local.truncate(page_end);
                 for (r, sc) in local { out_hits.push((col.clone(), r, sc)); }
             }
@@ -283,10 +280,7 @@ pub fn execute(cols: &[Arc<Collection>], req: &SearchRequest) -> Result<SearchRe
                 }
             }
             // Global merge-sort of the per-collection tops.
-            out_hits.sort_by(|a, b| {
-                let ord = cmp_scalar_opt(a.2.as_ref(), b.2.as_ref(), ss.missing_last);
-                if ss.ascending { ord } else { ord.reverse() }
-            });
+            out_hits.sort_by(|a, b| cmp_scalar_opt(a.2.as_ref(), b.2.as_ref(), ss.missing_last, ss.ascending));
 
             // Pagination.
             let end = page_end.min(out_hits.len());
@@ -819,14 +813,14 @@ fn sort_hits(hits: &mut Vec<(Arc<Collection>, u32)>, sort: &[SortSpec]) -> Resul
             let a_sc = col_field_vals[cai][si].as_ref().and_then(|m| m.get(ra));
             let b_sc = col_field_vals[cbi][si].as_ref().and_then(|m| m.get(rb));
             let ord = if col_field_indexed[cai][si] && col_field_indexed[cbi][si] {
-                cmp_scalar_opt(a_sc, b_sc, s.missing_last)
+                cmp_scalar_opt(a_sc, b_sc, s.missing_last, s.ascending)
             } else {
                 let av = docs[ai].as_ref().and_then(|v| v.get(&s.field));
                 let bv = docs[bi].as_ref().and_then(|v| v.get(&s.field));
-                cmp_json(av, bv, s.missing_last)
+                cmp_json(av, bv, s.missing_last, s.ascending)
             };
             if ord != std::cmp::Ordering::Equal {
-                return if s.ascending { ord } else { ord.reverse() };
+                return ord;
             }
         }
         ids[ai].cmp(&ids[bi])
@@ -836,13 +830,16 @@ fn sort_hits(hits: &mut Vec<(Arc<Collection>, u32)>, sort: &[SortSpec]) -> Resul
     Ok(())
 }
 
-fn cmp_scalar_opt(a: Option<&arkimedb_core::Scalar>, b: Option<&arkimedb_core::Scalar>, missing_last: bool) -> std::cmp::Ordering {
+/// Orders two sort values the ES way: `missing` places a doc without the
+/// field first or last whichever the direction (ES defaults to _last), and
+/// only present values are reversed for a descending sort.
+fn cmp_scalar_opt(a: Option<&arkimedb_core::Scalar>, b: Option<&arkimedb_core::Scalar>, missing_last: bool, ascending: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     match (a, b) {
         (None, None) => Equal,
         (None, _) => if missing_last { Greater } else { Less },
         (_, None) => if missing_last { Less } else { Greater },
-        (Some(x), Some(y)) => cmp_scalar(x, y),
+        (Some(x), Some(y)) => if ascending { cmp_scalar(x, y) } else { cmp_scalar(y, x) },
     }
 }
 
@@ -869,13 +866,14 @@ fn cmp_scalar(a: &arkimedb_core::Scalar, b: &arkimedb_core::Scalar) -> std::cmp:
     }
 }
 
-fn cmp_json(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>, missing_last: bool) -> std::cmp::Ordering {
+/// cmp_scalar_opt for values read from the stored doc (see it for `missing`)
+fn cmp_json(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>, missing_last: bool, ascending: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     match (a, b) {
         (None, None) => Equal,
         (None, _) => if missing_last { Greater } else { Less },
         (_, None) => if missing_last { Less } else { Greater },
-        (Some(x), Some(y)) => cmp_jv(x, y),
+        (Some(x), Some(y)) => if ascending { cmp_jv(x, y) } else { cmp_jv(y, x) },
     }
 }
 fn cmp_jv(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {

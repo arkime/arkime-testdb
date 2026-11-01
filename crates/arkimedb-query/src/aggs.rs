@@ -26,7 +26,9 @@ pub enum AggKind {
     Terms { field: String, size: usize, min_doc_count: u64, order: Option<(String, bool)> },
     TermsIpPort { ip_field: String, port_field: String, size: usize, sep: String },
     TermsAllIp { size: usize },
-    Histogram     { field: String, interval: f64 },
+    // order as for Terms (None = ES default, _key asc); min_doc_count below
+    // 1 is treated as 1, empty buckets are never emitted
+    Histogram     { field: String, interval: f64, min_doc_count: u64, order: Option<(String, bool)> },
     DateHistogram { field: String, interval_ms: i64, span_end_field: Option<String> },
     // one bucket: the rows that also match an ES query clause
     Filter { query: J },
@@ -168,17 +170,13 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
                 let f = field_of(v)?;
                 let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(10) as usize;
                 let mdc  = v.get("min_doc_count").and_then(|x| x.as_u64()).unwrap_or(1);
-                let order = v.get("order").and_then(|o| o.as_object()).and_then(|m| {
-                    m.iter().next().map(|(k, dir)| {
-                        (k.clone(), dir.as_str().map(|s| s.eq_ignore_ascii_case("asc")).unwrap_or(false))
-                    })
-                });
-                AggKind::Terms { field: f, size, min_doc_count: mdc, order }
+                AggKind::Terms { field: f, size, min_doc_count: mdc, order: parse_order(v) }
             }
             "histogram" => {
                 let f = field_of(v)?;
                 let interval = v.get("interval").and_then(|x| x.as_f64()).unwrap_or(1.0);
-                AggKind::Histogram { field: f, interval }
+                let mdc = v.get("min_doc_count").and_then(|x| x.as_u64()).unwrap_or(0).max(1);
+                AggKind::Histogram { field: f, interval, min_doc_count: mdc, order: parse_order(v) }
             }
             "date_histogram" => {
                 let f = field_of(v)?;
@@ -194,6 +192,52 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
     }
     let kind = kind.unwrap_or(AggKind::Count);
     Ok(AggRequest { name: name.to_string(), kind, subs })
+}
+/// A bucket agg's `order`: (key, ascending) where key is "_count", "_key" or
+/// a sub-agg name; None when absent.
+fn parse_order(v: &J) -> Option<(String, bool)> {
+    v.get("order").and_then(|o| o.as_object()).and_then(|m| {
+        m.iter().next().map(|(k, dir)| {
+            (k.clone(), dir.as_str().map(|s| s.eq_ignore_ascii_case("asc")).unwrap_or(false))
+        })
+    })
+}
+/// Sorts finished histogram buckets (every sub-agg already computed) by
+/// `order`: _key, _count or a metric sub-agg's value, with the key as the
+/// tiebreak; buckets under min_doc_count are dropped first.
+fn order_histogram_buckets(mut buckets: Vec<Bucket>, min_doc_count: u64, order: &Option<(String, bool)>) -> Result<Vec<Bucket>> {
+    buckets.retain(|b| b.doc_count >= min_doc_count);
+    let key_of = |b: &Bucket| b.key.as_f64().unwrap_or(0.0);
+    match order.as_ref().map(|(k, asc)| (k.as_str(), *asc)) {
+        None | Some(("_key", true)) => {}
+        Some(("_key", false)) => buckets.reverse(),
+        Some(("_count", asc)) => {
+            buckets.sort_by(|a, b| {
+                let ord = if asc { a.doc_count.cmp(&b.doc_count) } else { b.doc_count.cmp(&a.doc_count) };
+                ord.then_with(|| key_of(a).total_cmp(&key_of(b)))
+            });
+        }
+        Some((sub_name, asc)) => {
+            let value = |b: &Bucket| -> Result<f64> {
+                match b.subs.get(sub_name) {
+                    Some(AggResult::Metric(v)) => Ok(v.unwrap_or(f64::NEG_INFINITY)),
+                    Some(AggResult::Long(n)) | Some(AggResult::Cardinality(n)) => Ok(*n as f64),
+                    Some(_) => Err(Error::BadRequest(format!("histogram order agg is not a metric: {sub_name}"))),
+                    None => Err(Error::BadRequest(format!("histogram order references unknown agg: {sub_name}"))),
+                }
+            };
+            let mut vals = Vec::with_capacity(buckets.len());
+            for b in &buckets { vals.push(value(b)?); }
+            let mut idx: Vec<usize> = (0..buckets.len()).collect();
+            idx.sort_by(|&a, &b| {
+                let ord = if asc { vals[a].total_cmp(&vals[b]) } else { vals[b].total_cmp(&vals[a]) };
+                ord.then_with(|| key_of(&buckets[a]).total_cmp(&key_of(&buckets[b])))
+            });
+            let mut taken: Vec<Option<Bucket>> = buckets.into_iter().map(Some).collect();
+            buckets = idx.into_iter().map(|i| taken[i].take().unwrap()).collect();
+        }
+    }
+    Ok(buckets)
 }
 fn field_of(v: &J) -> Result<String> {
     v.get("field").and_then(|x| x.as_str()).map(String::from)
@@ -480,15 +524,15 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
             }
             Ok(AggResult::TermsBuckets { buckets, sum_other_doc_count: total.saturating_sub(kept) })
         }
-        AggKind::Histogram { field, interval } => {
+        AggKind::Histogram { field, interval, min_doc_count, order } => {
             // Fast path: if all sub-aggs are metric (sum/min/max/avg/value_count)
             // and the histogram field + sub-agg fields are indexable, avoid
             // the quadratic "for each bucket, for each metric, iterate all
             // unique values" scan. Instead build row->Scalar maps once per
             // field (cached on Collection via sort_cache) and do a single
             // pass over the matching rows.
-            if let Some(fast) = try_histogram_metric_fast(sets, field, *interval, &spec.subs)? {
-                return Ok(fast);
+            if let Some(AggResult::Buckets(fast)) = try_histogram_metric_fast(sets, field, *interval, &spec.subs)? {
+                return Ok(AggResult::Buckets(order_histogram_buckets(fast, *min_doc_count, order)?));
             }
             let mut acc: AHashMap<i64, u64> = AHashMap::new();
             // Per-bucket row bitmaps, scoped to each collection, so sub-aggs
@@ -565,7 +609,7 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                     subs: sub_out,
                 });
             }
-            Ok(AggResult::Buckets(buckets))
+            Ok(AggResult::Buckets(order_histogram_buckets(buckets, *min_doc_count, order)?))
         }
         AggKind::DateHistogram { field, interval_ms, span_end_field } => {
             // Two-field span bucketing: if span_end_field is set, a doc with
