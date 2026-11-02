@@ -28,7 +28,8 @@ pub enum AggKind {
     TermsAllIp { size: usize },
     // order as for Terms (None = ES default, _key asc); min_doc_count below
     // 1 is treated as 1, empty buckets are never emitted
-    Histogram     { field: String, interval: f64, min_doc_count: u64, order: Option<(String, bool)> },
+    // offset: the buckets start that far past the interval's multiples (ES histogram offset)
+    Histogram     { field: String, interval: f64, offset: f64, min_doc_count: u64, order: Option<(String, bool)> },
     DateHistogram { field: String, interval_ms: i64, span_end_field: Option<String> },
     // one bucket: the rows that also match an ES query clause
     Filter { query: J },
@@ -175,8 +176,9 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
             "histogram" => {
                 let f = field_of(v)?;
                 let interval = v.get("interval").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                let offset = v.get("offset").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 let mdc = v.get("min_doc_count").and_then(|x| x.as_u64()).unwrap_or(0).max(1);
-                AggKind::Histogram { field: f, interval, min_doc_count: mdc, order: parse_order(v) }
+                AggKind::Histogram { field: f, interval, offset, min_doc_count: mdc, order: parse_order(v) }
             }
             "date_histogram" => {
                 let f = field_of(v)?;
@@ -524,14 +526,14 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
             }
             Ok(AggResult::TermsBuckets { buckets, sum_other_doc_count: total.saturating_sub(kept) })
         }
-        AggKind::Histogram { field, interval, min_doc_count, order } => {
+        AggKind::Histogram { field, interval, offset, min_doc_count, order } => {
             // Fast path: if all sub-aggs are metric (sum/min/max/avg/value_count)
             // and the histogram field + sub-agg fields are indexable, avoid
             // the quadratic "for each bucket, for each metric, iterate all
             // unique values" scan. Instead build row->Scalar maps once per
             // field (cached on Collection via sort_cache) and do a single
             // pass over the matching rows.
-            if let Some(AggResult::Buckets(fast)) = try_histogram_metric_fast(sets, field, *interval, &spec.subs)? {
+            if let Some(AggResult::Buckets(fast)) = try_histogram_metric_fast(sets, field, *interval, *offset, &spec.subs)? {
                 return Ok(AggResult::Buckets(order_histogram_buckets(fast, *min_doc_count, order)?));
             }
             let mut acc: AHashMap<i64, u64> = AHashMap::new();
@@ -546,8 +548,8 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                 if saw_any {
                     col.index.for_each_value(field, |s, vb| {
                         let Some(v) = scalar_to_f64(s) else { return; };
-                        // Bucket start value (aligned to interval).
-                        let key = ((v / interval).floor() as i64).saturating_mul(*interval as i64);
+                        // Bucket start value (aligned to interval, from offset).
+                        let key = histogram_key(v, *interval, *offset);
                         let hits = vb & bm;
                         if hits.is_empty() { return; }
                         *acc.entry(key).or_default() += hits.len();
@@ -566,13 +568,14 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                         }
                     });
                     let iv = *interval as i64;
+                    let off = *offset as i64;
                     if iv > 0 {
                         col.index.for_each_value(&lte_f, |s, vb| {
                             if let Some(end_ms) = scalar_to_i64_ms(s) {
                                 for r in (vb & bm).iter() {
                                     let Some(start_ms) = start_of.get(&r).copied() else { continue; };
                                     let (lo, hi) = (start_ms.min(end_ms), start_ms.max(end_ms));
-                                    let first = (lo / iv) * iv;
+                                    let first = (lo - off).div_euclid(iv) * iv + off;
                                     let mut k = first;
                                     while k <= hi {
                                         *acc.entry(k).or_default() += 1;
@@ -750,6 +753,13 @@ fn iso_ms(ms: i64) -> String {
 #[allow(dead_code)]
 fn _touch(_s: &Scalar) { let _ = cmp_scalar(&Scalar::Null, &Scalar::Null); let _ = FieldType::Keyword; }
 
+/// The start of the histogram bucket a value falls in: the multiple of
+/// interval at or below it, the buckets starting offset past the multiples
+/// (an ES histogram's offset; 0 for none).
+fn histogram_key(v: f64, interval: f64, offset: f64) -> i64 {
+    (((v - offset) / interval).floor() as i64).saturating_mul(interval as i64).saturating_add(offset as i64)
+}
+
 /// Fast path for `histogram` with only metric sub-aggs (sum/min/max/avg/
 /// value_count). Builds row->Scalar maps per field using the collection
 /// sort_cache (which is invalidated on writes), then does a single pass
@@ -762,6 +772,7 @@ fn try_histogram_metric_fast(
     sets: &[(Arc<Collection>, roaring::RoaringBitmap)],
     hist_field: &str,
     interval: f64,
+    offset: f64,
     subs: &[AggRequest],
 ) -> Result<Option<AggResult>> {
     if !(interval > 0.0) { return Ok(None); }
@@ -805,7 +816,7 @@ fn try_histogram_metric_fast(
 
         for r in bm.iter() {
             let Some(hv) = hist_map.get(&r).and_then(scalar_to_f64) else { continue; };
-            let key = ((hv / interval).floor() as i64).saturating_mul(iv);
+            let key = histogram_key(hv, interval, offset);
             *doc_count.entry(key).or_default() += 1;
             for (i, sub_map) in sub_maps.iter().enumerate() {
                 let Some(sv) = sub_map.get(&r).and_then(scalar_to_f64) else { continue; };
