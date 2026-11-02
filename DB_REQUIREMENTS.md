@@ -183,7 +183,7 @@ least the following, computed server‑side over the full matching set
 - `count_distinct` (approximate acceptable; must scale to 10⁹ cardinality
   per time slice).
 - `sum`, `min`, `max`, `avg` of numeric fields.
-- `percentiles` (MAY) — not used today but commonly wanted.
+- `percentiles` (MAY) — the dashboard and SPI Graph median, p90, p95 and p99 metrics, one percent per agg, ordered by as `name[95.0]`.
 
 ### 3.2 Bucket aggregations (MUST)
 

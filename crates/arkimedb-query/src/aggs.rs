@@ -1,4 +1,4 @@
-//! Aggregations: count, sum/min/max/avg, cardinality, terms, histogram,
+//! Aggregations: count, sum/min/max/avg, cardinality, percentiles, terms, histogram,
 //! date_histogram (incl. two-field span bucketing), filter, plus nested
 //! sub-aggs.
 
@@ -21,6 +21,9 @@ pub enum AggKind {
     Min   { field: String },
     Max   { field: String },
     Avg   { field: String },
+    // exact, interpolated between the two nearest values like ES's t-digest
+    // does on small sets; percents are 0-100
+    Percentiles { field: String, percents: Vec<f64> },
     // order: (key, ascending) where key is "_count", "_key", or a metric
     // sub-agg name; None = ES default (_count desc)
     Terms { field: String, size: usize, min_doc_count: u64, order: Option<(String, bool)> },
@@ -47,6 +50,8 @@ pub enum AggResult {
     Metric(Option<f64>),
     Long(u64),
     Cardinality(u64),
+    // (percent, value) in the requested order; None when the field has no values
+    Percentiles(Vec<(f64, Option<f64>)>),
     Buckets(Vec<Bucket>),
     TermsBuckets { buckets: Vec<Bucket>, sum_other_doc_count: u64 },
     SingleBucket { doc_count: u64, subs: AHashMap<String, AggResult> },
@@ -81,6 +86,12 @@ impl AggResult {
             AggResult::Metric(v) => serde_json::json!({ "value": v }),
             AggResult::Long(v)   => serde_json::json!({ "value": v }),
             AggResult::Cardinality(v) => serde_json::json!({ "value": v }),
+            AggResult::Percentiles(ps) => {
+                // ES keys each percent by its double ("95.0")
+                let mut values = serde_json::Map::new();
+                for (p, v) in ps { values.insert(percent_key(p), serde_json::json!(v)); }
+                serde_json::json!({ "values": values })
+            }
             AggResult::Multi(m) => {
                 let mut out = serde_json::Map::new();
                 for (k, v) in m { out.insert(k, v.into_json()); }
@@ -147,6 +158,18 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
             "min" => AggKind::Min { field: field_of(v)? },
             "max" => AggKind::Max { field: field_of(v)? },
             "avg" => AggKind::Avg { field: field_of(v)? },
+            "percentiles" => {
+                // ES's default percents when none are given
+                let percents = match v.get("percents") {
+                    Some(J::Array(a)) => a.iter().map(|x| x.as_f64().ok_or_else(|| Error::BadRequest("percents must be numbers".into()))).collect::<Result<Vec<f64>>>()?,
+                    Some(_) => return Err(Error::BadRequest("percents must be an array".into())),
+                    None => vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0],
+                };
+                if percents.iter().any(|p| !(0.0..=100.0).contains(p)) {
+                    return Err(Error::BadRequest("percent must be in [0, 100]".into()));
+                }
+                AggKind::Percentiles { field: field_of(v)?, percents }
+            }
             "terms" => {
                 if let Some(script) = v.get("script") {
                     let src = script.get("source").or_else(|| script.get("inline")).and_then(|x| x.as_str()).unwrap_or("");
@@ -204,6 +227,34 @@ fn parse_order(v: &J) -> Option<(String, bool)> {
         })
     })
 }
+/// ES's key for a percent in a percentiles result: Java's Double.toString
+/// for the usual ones, 95 -> "95.0", 99.9 -> "99.9".
+fn percent_key(p: f64) -> String {
+    if p.fract() == 0.0 { format!("{p:.1}") } else { format!("{p}") }
+}
+/// An order key naming a sub-agg: "name", or "name[95.0]" for one value of
+/// a multi-value metric (a percentile). Returns (name, the bracketed key).
+fn split_order_key(key: &str) -> (&str, Option<&str>) {
+    match (key.find('['), key.ends_with(']')) {
+        (Some(i), true) => (&key[..i], Some(&key[i + 1..key.len() - 1])),
+        _ => (key, None),
+    }
+}
+/// A metric result's value to order buckets by; a percentiles result gives
+/// the percent the order key names (its first when it names none). None when
+/// the result isn't a metric.
+fn metric_order_value(res: &AggResult, which: Option<&str>) -> Option<f64> {
+    match res {
+        AggResult::Metric(v) => Some(v.unwrap_or(f64::NEG_INFINITY)),
+        AggResult::Long(n) | AggResult::Cardinality(n) => Some(*n as f64),
+        AggResult::Percentiles(ps) => {
+            let want = which.and_then(|w| w.parse::<f64>().ok());
+            let hit = match want { Some(w) => ps.iter().find(|(p, _)| *p == w), None => ps.first() };
+            hit.map(|(_, v)| v.unwrap_or(f64::NEG_INFINITY))
+        }
+        _ => None,
+    }
+}
 /// Sorts finished histogram buckets (every sub-agg already computed) by
 /// `order`: _key, _count or a metric sub-agg's value, with the key as the
 /// tiebreak; buckets under min_doc_count are dropped first.
@@ -219,12 +270,12 @@ fn order_histogram_buckets(mut buckets: Vec<Bucket>, min_doc_count: u64, order: 
                 ord.then_with(|| key_of(a).total_cmp(&key_of(b)))
             });
         }
-        Some((sub_name, asc)) => {
+        Some((order_key, asc)) => {
+            let (sub_name, which) = split_order_key(order_key);
             let value = |b: &Bucket| -> Result<f64> {
                 match b.subs.get(sub_name) {
-                    Some(AggResult::Metric(v)) => Ok(v.unwrap_or(f64::NEG_INFINITY)),
-                    Some(AggResult::Long(n)) | Some(AggResult::Cardinality(n)) => Ok(*n as f64),
-                    Some(_) => Err(Error::BadRequest(format!("histogram order agg is not a metric: {sub_name}"))),
+                    Some(res) => metric_order_value(res, which)
+                        .ok_or_else(|| Error::BadRequest(format!("histogram order agg is not a metric: {sub_name}"))),
                     None => Err(Error::BadRequest(format!("histogram order references unknown agg: {sub_name}"))),
                 }
             };
@@ -341,6 +392,20 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                 _ => unreachable!(),
             }))
         }
+        AggKind::Percentiles { field, percents } => {
+            // the index hands each distinct value with its rows, so the
+            // values' counts are enough: memory goes with distinct values,
+            // not rows (a row with several values counts each, like ES)
+            let mut counts: Vec<(f64, u64)> = Vec::new();
+            for (col, bm) in sets {
+                col.index.for_each_value(field, |s, vb| {
+                    let count = (vb & bm).len();
+                    if count == 0 { return; }
+                    if let Some(v) = scalar_to_f64(s) { counts.push((v, count)); }
+                });
+            }
+            Ok(AggResult::Percentiles(percents.iter().map(|p| (*p, weighted_percentile(&mut counts, *p))).collect()))
+        }
         AggKind::Terms { field, size, min_doc_count, order } => {
             // Merge term counts across all collections. Keep per-collection
             // bitmaps separate so sub-aggs see the right row set and so that
@@ -385,16 +450,15 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                 Some(("_key", asc)) => {
                     merged.sort_by(|a, b| if asc { a.3.cmp(&b.3) } else { b.3.cmp(&a.3) });
                 }
-                Some((sub_name, asc)) => {
+                Some((order_key, asc)) => {
+                    let (sub_name, which) = split_order_key(order_key);
                     let Some(sub) = spec.subs.iter().find(|s| s.name == sub_name) else {
                         return Err(Error::BadRequest(format!("terms order references unknown agg: {sub_name}")));
                     };
                     let mut vals: Vec<f64> = Vec::with_capacity(merged.len());
                     for (_, _, per_col, _) in &merged {
-                        let v = match run_one(&subs_sets_of(per_col), sub)? {
-                            AggResult::Metric(v) => v.unwrap_or(f64::NEG_INFINITY),
-                            AggResult::Long(n) | AggResult::Cardinality(n) => n as f64,
-                            _ => return Err(Error::BadRequest(format!("terms order agg is not a metric: {sub_name}"))),
+                        let Some(v) = metric_order_value(&run_one(&subs_sets_of(per_col), sub)?, which) else {
+                            return Err(Error::BadRequest(format!("terms order agg is not a metric: {sub_name}")));
                         };
                         vals.push(v);
                     }
@@ -708,6 +772,28 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
     }
 }
 
+/// The p-th percentile (0-100) of values given with their counts: linear
+/// between the two values nearest rank p/100 * (n - 1), as numpy and R-7 do.
+/// Sorts `counts` in place; None when there are no values.
+fn weighted_percentile(counts: &mut [(f64, u64)], p: f64) -> Option<f64> {
+    let n: u64 = counts.iter().map(|c| c.1).sum();
+    if n == 0 { return None; }
+    counts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let rank = p / 100.0 * (n - 1) as f64;
+    let lo = rank.floor() as u64;
+    let hi = rank.ceil() as u64;
+    // the value at a 0-based position among all n
+    let at = |pos: u64| -> f64 {
+        let mut seen = 0u64;
+        for (v, c) in counts.iter() {
+            seen += c;
+            if pos < seen { return *v; }
+        }
+        counts[counts.len() - 1].0
+    };
+    let (a, b) = (at(lo), at(hi));
+    Some(a + (b - a) * (rank - lo as f64))
+}
 fn scalar_to_f64(s: &Scalar) -> Option<f64> {
     Some(match s {
         Scalar::I64(v) => *v as f64,
@@ -854,4 +940,34 @@ fn try_histogram_metric_fast(
         });
     }
     Ok(Some(AggResult::Buckets(buckets)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_interpolates_between_values() {
+        // 1, 2, 3, 4 as counts of distinct values
+        let mut c = vec![(4.0, 1), (1.0, 1), (3.0, 1), (2.0, 1)];
+        assert_eq!(weighted_percentile(&mut c, 50.0), Some(2.5));
+        assert_eq!(weighted_percentile(&mut c, 0.0), Some(1.0));
+        assert_eq!(weighted_percentile(&mut c, 100.0), Some(4.0));
+        // 10 copies of 1 and one 100: the median is 1, p99 near the top
+        let mut d = vec![(1.0, 10), (100.0, 1)];
+        assert_eq!(weighted_percentile(&mut d, 50.0), Some(1.0));
+        assert!((weighted_percentile(&mut d, 99.0).unwrap() - 90.1).abs() < 1e-9);
+        assert_eq!(weighted_percentile(&mut [], 50.0), None);
+    }
+
+    #[test]
+    fn percent_keys_and_order_keys_match_es() {
+        assert_eq!(percent_key(95.0), "95.0");
+        assert_eq!(percent_key(99.9), "99.9");
+        assert_eq!(split_order_key("m0[95.0]"), ("m0", Some("95.0")));
+        assert_eq!(split_order_key("m0"), ("m0", None));
+        let res = AggResult::Percentiles(vec![(50.0, Some(3.0)), (95.0, Some(9.0))]);
+        assert_eq!(metric_order_value(&res, Some("95.0")), Some(9.0));
+        assert_eq!(metric_order_value(&res, None), Some(3.0));
+    }
 }
