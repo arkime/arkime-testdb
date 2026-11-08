@@ -963,7 +963,7 @@ async fn update_doc(Path((idx, id)): Path<(String, String)>, State(s): State<Arc
     ensure_with_templates(&s, &idx);
     // Script path: interpret known Arkime painless scripts (tags, hunt).
     if let Some(script) = body.get("script") {
-        return apply_script_update(&s, &idx, &id, script).await;
+        return apply_script_update(&s, &idx, &id, script, is_refresh_true(&q.refresh)).await;
     }
     // Elasticsearch _update semantics:
     //   { "doc": {...} }                        -> merge doc into existing
@@ -1038,6 +1038,18 @@ fn apply_script_mutation(src: &mut J, script_src: &str, params: &J) -> Result<()
     };
     let param_tags = params.get("tags").and_then(|v| v.as_array()).cloned();
 
+    // ArkimeDb collection update: set replaces top level fields whole, then unset removes fields
+    if ps.contains("ctx._source.putAll(params.set)") {
+        let (Some(J::Object(set)), Some(J::Array(unset))) = (params.get("set"), params.get("unset")) else {
+            return Err(Error::BadRequest("update script needs params.set and params.unset".into()));
+        };
+        for (k, v) in set { obj.insert(k.clone(), v.clone()); }
+        for k in unset {
+            if let Some(k) = k.as_str() { obj.remove(k); }
+        }
+        return Ok(());
+    }
+
     // addTagsToSession
     if ps.contains("ctx._source.tags.indexOf") && ps.contains("ctx._source.tags.add") && !ps.contains("remove(idx)") {
         if let Some(tags) = param_tags {
@@ -1084,7 +1096,7 @@ fn apply_script_mutation(src: &mut J, script_src: &str, params: &J) -> Result<()
     Err(Error::BadRequest(format!("unsupported painless script: {}", ps.chars().take(80).collect::<String>())))
 }
 
-async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J) -> Response {
+async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J, refresh: bool) -> Response {
     let src_text = script.get("source").or_else(|| script.get("inline")).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let params = script.get("params").cloned().unwrap_or(J::Null);
     // Find the collection containing the doc.
@@ -1124,7 +1136,11 @@ async fn apply_script_update(s: &Arc<AppState>, idx: &str, id: &str, script: &J)
     };
     let engine = s.engine.clone();
     let col_name_c = col_name.clone();
-    match blocking(move || engine.bulk_write(Some(&col_name_c), vec![op])).await {
+    match blocking(move || {
+        let r = engine.bulk_write(Some(&col_name_c), vec![op]);
+        if refresh { let _ = engine.refresh(Some(&col_name_c)); }
+        r
+    }).await {
         Ok(mut v) => {
             let mut o = v.pop().unwrap();
             if let Some(ref mut r) = o.ok { r.action = "update"; }
@@ -3012,5 +3028,27 @@ fn fp_filter(v: J, positions: &[(usize, usize)], pats: &[Vec<FpSeg>]) -> Option<
             if out.is_empty() { None } else { Some(J::Array(out)) }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UPDATE: &str = "ctx._source.putAll(params.set); for (def k : params.unset) { ctx._source.remove(k); }";
+
+    #[test]
+    fn update_script_replaces_and_removes() {
+        let mut doc = json!({ "name": "a", "settings": { "x": 1, "y": 2 }, "gone": true, "keep": 1 });
+        let params = json!({ "set": { "settings": { "x": 3 }, "name": "b" }, "unset": ["gone", "never"] });
+        apply_script_mutation(&mut doc, UPDATE, &params).unwrap();
+        assert_eq!(doc, json!({ "name": "b", "settings": { "x": 3 }, "keep": 1 }));
+    }
+
+    #[test]
+    fn update_script_needs_its_params() {
+        let mut doc = json!({ "a": 1 });
+        assert!(apply_script_mutation(&mut doc, UPDATE, &json!({ "set": {} })).is_err());
+        assert_eq!(doc, json!({ "a": 1 }));
     }
 }
