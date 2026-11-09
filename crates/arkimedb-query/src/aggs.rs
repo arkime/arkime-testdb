@@ -24,15 +24,18 @@ pub enum AggKind {
     // exact, interpolated between the two nearest values like ES's t-digest
     // does on small sets; percents are 0-100
     Percentiles { field: String, percents: Vec<f64> },
-    // order: (key, ascending) where key is "_count", "_key", or a metric
-    // sub-agg name; None = ES default (_count desc)
-    Terms { field: String, size: usize, min_doc_count: u64, order: Option<(String, bool)> },
+    // Arkime's "has a value" max script: 1 when a row has the field, else 0,
+    // ordered on first so buckets with no values for a metric rank last
+    HasValue { field: String },
+    // order: (key, ascending) pairs compared in turn, where a key is "_count",
+    // "_key", or a metric sub-agg name; empty = ES default (_count desc)
+    Terms { field: String, size: usize, min_doc_count: u64, order: Vec<(String, bool)> },
     TermsIpPort { ip_field: String, port_field: String, size: usize, sep: String },
     TermsAllIp { size: usize },
-    // order as for Terms (None = ES default, _key asc); min_doc_count below
+    // order as for Terms (empty = ES default, _key asc); min_doc_count below
     // 1 is treated as 1, empty buckets are never emitted
     // offset: the buckets start that far past the interval's multiples (ES histogram offset)
-    Histogram     { field: String, interval: f64, offset: f64, min_doc_count: u64, order: Option<(String, bool)> },
+    Histogram     { field: String, interval: f64, offset: f64, min_doc_count: u64, order: Vec<(String, bool)> },
     DateHistogram { field: String, interval_ms: i64, span_end_field: Option<String> },
     // one bucket: the rows that also match an ES query clause
     Filter { query: J },
@@ -156,6 +159,10 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
             "cardinality" => AggKind::Cardinality { field: field_of(v)? },
             "sum" => AggKind::Sum { field: field_of(v)? },
             "min" => AggKind::Min { field: field_of(v)? },
+            "max" if v.get("script").is_some() => match has_value_field(v) {
+                Some(f) => AggKind::HasValue { field: f },
+                None => return Err(Error::BadRequest("unsupported max script".into())),
+            },
             "max" => AggKind::Max { field: field_of(v)? },
             "avg" => AggKind::Avg { field: field_of(v)? },
             "percentiles" => {
@@ -218,14 +225,45 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
     let kind = kind.unwrap_or(AggKind::Count);
     Ok(AggRequest { name: name.to_string(), kind, subs })
 }
-/// A bucket agg's `order`: (key, ascending) where key is "_count", "_key" or
-/// a sub-agg name; None when absent.
-fn parse_order(v: &J) -> Option<(String, bool)> {
-    v.get("order").and_then(|o| o.as_object()).and_then(|m| {
-        m.iter().next().map(|(k, dir)| {
-            (k.clone(), dir.as_str().map(|s| s.eq_ignore_ascii_case("asc")).unwrap_or(false))
-        })
-    })
+/// The field of Arkime's "has a value" script on a max agg, None for any other script.
+fn has_value_field(v: &J) -> Option<String> {
+    let script = v.get("script")?;
+    let src = script.get("source").or_else(|| script.get("inline")).and_then(|x| x.as_str())?;
+    let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact != "doc.containsKey(params.f)&&doc[params.f].size()>0?1:0" { return None; }
+    script.get("params")?.get("f")?.as_str().map(String::from)
+}
+/// A bucket agg's `order`: (key, ascending) pairs where a key is "_count",
+/// "_key" or a sub-agg name, from one object or ES's array of them; empty when absent.
+fn parse_order(v: &J) -> Vec<(String, bool)> {
+    let first = |m: &serde_json::Map<String, J>| m.iter().next().map(|(k, dir)| {
+        (k.clone(), dir.as_str().map(|s| s.eq_ignore_ascii_case("asc")).unwrap_or(false))
+    });
+    match v.get("order") {
+        Some(J::Object(m)) => first(m).into_iter().collect(),
+        Some(J::Array(a)) => a.iter().filter_map(|x| x.as_object()).filter_map(first).collect(),
+        _ => Vec::new(),
+    }
+}
+/// One `order` key's values for each candidate bucket.
+enum OrderCol { Count, Key, Metric(Vec<f64>) }
+/// Candidate indexes sorted by each order key in turn, then by the bucket key ascending.
+fn order_index(n: usize, cols: &[(OrderCol, bool)], count: impl Fn(usize) -> u64,
+               key_cmp: impl Fn(usize, usize) -> std::cmp::Ordering) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        for (col, asc) in cols {
+            let ord = match col {
+                OrderCol::Count => count(a).cmp(&count(b)),
+                OrderCol::Key => key_cmp(a, b),
+                OrderCol::Metric(v) => v[a].total_cmp(&v[b]),
+            };
+            let ord = if *asc { ord } else { ord.reverse() };
+            if ord != std::cmp::Ordering::Equal { return ord; }
+        }
+        key_cmp(a, b)
+    });
+    idx
 }
 /// ES's key for a percent in a percentiles result: Java's Double.toString
 /// for the usual ones, 95 -> "95.0", 99.9 -> "99.9".
@@ -256,41 +294,35 @@ fn metric_order_value(res: &AggResult, which: Option<&str>) -> Option<f64> {
     }
 }
 /// Sorts finished histogram buckets (every sub-agg already computed) by
-/// `order`: _key, _count or a metric sub-agg's value, with the key as the
-/// tiebreak; buckets under min_doc_count are dropped first.
-fn order_histogram_buckets(mut buckets: Vec<Bucket>, min_doc_count: u64, order: &Option<(String, bool)>) -> Result<Vec<Bucket>> {
+/// `order`: _key, _count or a metric sub-agg's value for each key in turn,
+/// with the key as the tiebreak; buckets under min_doc_count are dropped first.
+fn order_histogram_buckets(mut buckets: Vec<Bucket>, min_doc_count: u64, order: &[(String, bool)]) -> Result<Vec<Bucket>> {
     buckets.retain(|b| b.doc_count >= min_doc_count);
     let key_of = |b: &Bucket| b.key.as_f64().unwrap_or(0.0);
-    match order.as_ref().map(|(k, asc)| (k.as_str(), *asc)) {
-        None | Some(("_key", true)) => {}
-        Some(("_key", false)) => buckets.reverse(),
-        Some(("_count", asc)) => {
-            buckets.sort_by(|a, b| {
-                let ord = if asc { a.doc_count.cmp(&b.doc_count) } else { b.doc_count.cmp(&a.doc_count) };
-                ord.then_with(|| key_of(a).total_cmp(&key_of(b)))
-            });
-        }
-        Some((order_key, asc)) => {
-            let (sub_name, which) = split_order_key(order_key);
-            let value = |b: &Bucket| -> Result<f64> {
-                match b.subs.get(sub_name) {
-                    Some(res) => metric_order_value(res, which)
-                        .ok_or_else(|| Error::BadRequest(format!("histogram order agg is not a metric: {sub_name}"))),
-                    None => Err(Error::BadRequest(format!("histogram order references unknown agg: {sub_name}"))),
+    let mut cols = Vec::with_capacity(order.len());
+    for (order_key, asc) in order {
+        let col = match order_key.as_str() {
+            "_count" => OrderCol::Count,
+            "_key" => OrderCol::Key,
+            _ => {
+                let (sub_name, which) = split_order_key(order_key);
+                let mut vals = Vec::with_capacity(buckets.len());
+                for b in &buckets {
+                    vals.push(match b.subs.get(sub_name) {
+                        Some(res) => metric_order_value(res, which)
+                            .ok_or_else(|| Error::BadRequest(format!("histogram order agg is not a metric: {sub_name}")))?,
+                        None => return Err(Error::BadRequest(format!("histogram order references unknown agg: {sub_name}"))),
+                    });
                 }
-            };
-            let mut vals = Vec::with_capacity(buckets.len());
-            for b in &buckets { vals.push(value(b)?); }
-            let mut idx: Vec<usize> = (0..buckets.len()).collect();
-            idx.sort_by(|&a, &b| {
-                let ord = if asc { vals[a].total_cmp(&vals[b]) } else { vals[b].total_cmp(&vals[a]) };
-                ord.then_with(|| key_of(&buckets[a]).total_cmp(&key_of(&buckets[b])))
-            });
-            let mut taken: Vec<Option<Bucket>> = buckets.into_iter().map(Some).collect();
-            buckets = idx.into_iter().map(|i| taken[i].take().unwrap()).collect();
-        }
+                OrderCol::Metric(vals)
+            }
+        };
+        cols.push((col, *asc));
     }
-    Ok(buckets)
+    let idx = order_index(buckets.len(), &cols, |i| buckets[i].doc_count,
+                          |a, b| key_of(&buckets[a]).total_cmp(&key_of(&buckets[b])));
+    let mut taken: Vec<Option<Bucket>> = buckets.into_iter().map(Some).collect();
+    Ok(idx.into_iter().map(|i| taken[i].take().unwrap()).collect())
 }
 fn field_of(v: &J) -> Result<String> {
     v.get("field").and_then(|x| x.as_str()).map(String::from)
@@ -392,6 +424,18 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                 _ => unreachable!(),
             }))
         }
+        AggKind::HasValue { field } => {
+            // ES's max of the script's 1 or 0 per row, null with no rows
+            if sets.iter().all(|(_, bm)| bm.is_empty()) { return Ok(AggResult::Metric(None)); }
+            let mut has = false;
+            for (col, bm) in sets {
+                col.index.for_each_value(field, |_s, vb| {
+                    if !has && !vb.is_disjoint(bm) { has = true; }
+                });
+                if has { break; }
+            }
+            Ok(AggResult::Metric(Some(if has { 1.0 } else { 0.0 })))
+        }
         AggKind::Percentiles { field, percents } => {
             // the index hands each distinct value with its rows, so the
             // values' counts are enough: memory goes with distinct values,
@@ -438,40 +482,36 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                 }).collect()
             };
             // Rank candidates BEFORE truncating to size. ES default is count
-            // desc with encoded-key asc tiebreak; `order` may name _count,
-            // _key, or a metric sub-agg (computed for every candidate).
-            match order.as_ref().map(|(k, asc)| (k.as_str(), *asc)) {
-                None | Some(("_count", false)) => {
-                    merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
-                }
-                Some(("_count", true)) => {
-                    merged.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)));
-                }
-                Some(("_key", asc)) => {
-                    merged.sort_by(|a, b| if asc { a.3.cmp(&b.3) } else { b.3.cmp(&a.3) });
-                }
-                Some((order_key, asc)) => {
-                    let (sub_name, which) = split_order_key(order_key);
-                    let Some(sub) = spec.subs.iter().find(|s| s.name == sub_name) else {
-                        return Err(Error::BadRequest(format!("terms order references unknown agg: {sub_name}")));
+            // desc with encoded-key asc tiebreak; each `order` key may name
+            // _count, _key, or a metric sub-agg (computed for every candidate).
+            if order.is_empty() {
+                merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
+            } else {
+                let mut cols = Vec::with_capacity(order.len());
+                for (order_key, asc) in order {
+                    let col = match order_key.as_str() {
+                        "_count" => OrderCol::Count,
+                        "_key" => OrderCol::Key,
+                        _ => {
+                            let (sub_name, which) = split_order_key(order_key);
+                            let Some(sub) = spec.subs.iter().find(|s| s.name == sub_name) else {
+                                return Err(Error::BadRequest(format!("terms order references unknown agg: {sub_name}")));
+                            };
+                            let mut vals: Vec<f64> = Vec::with_capacity(merged.len());
+                            for (_, _, per_col, _) in &merged {
+                                let Some(v) = metric_order_value(&run_one(&subs_sets_of(per_col), sub)?, which) else {
+                                    return Err(Error::BadRequest(format!("terms order agg is not a metric: {sub_name}")));
+                                };
+                                vals.push(v);
+                            }
+                            OrderCol::Metric(vals)
+                        }
                     };
-                    let mut vals: Vec<f64> = Vec::with_capacity(merged.len());
-                    for (_, _, per_col, _) in &merged {
-                        let Some(v) = metric_order_value(&run_one(&subs_sets_of(per_col), sub)?, which) else {
-                            return Err(Error::BadRequest(format!("terms order agg is not a metric: {sub_name}")));
-                        };
-                        vals.push(v);
-                    }
-                    let mut idx: Vec<usize> = (0..merged.len()).collect();
-                    idx.sort_by(|&a, &b| {
-                        let ord = if asc { vals[a].total_cmp(&vals[b]) } else { vals[b].total_cmp(&vals[a]) };
-                        ord.then_with(|| merged[a].3.cmp(&merged[b].3))
-                    });
-                    let mut reordered = Vec::with_capacity(merged.len());
-                    let mut taken: Vec<Option<_>> = merged.into_iter().map(Some).collect();
-                    for i in idx { reordered.push(taken[i].take().unwrap()); }
-                    merged = reordered;
+                    cols.push((col, *asc));
                 }
+                let idx = order_index(merged.len(), &cols, |i| merged[i].1, |a, b| merged[a].3.cmp(&merged[b].3));
+                let mut taken: Vec<Option<_>> = merged.into_iter().map(Some).collect();
+                merged = idx.into_iter().map(|i| taken[i].take().unwrap()).collect();
             }
             let total: u64 = merged.iter().map(|m| m.1).sum();
             let mut kept: u64 = 0;
@@ -969,5 +1009,62 @@ mod tests {
         let res = AggResult::Percentiles(vec![(50.0, Some(3.0)), (95.0, Some(9.0))]);
         assert_eq!(metric_order_value(&res, Some("95.0")), Some(9.0));
         assert_eq!(metric_order_value(&res, None), Some(3.0));
+    }
+
+    #[test]
+    fn order_is_an_object_or_an_array_of_them() {
+        assert_eq!(parse_order(&serde_json::json!({ "order": { "m": "asc" } })), vec![("m".to_string(), true)]);
+        assert_eq!(parse_order(&serde_json::json!({ "order": [{ "m_has": "desc" }, { "m[95.0]": "asc" }] })),
+                   vec![("m_has".to_string(), false), ("m[95.0]".to_string(), true)]);
+        assert!(parse_order(&serde_json::json!({})).is_empty());
+    }
+
+    const HAS_VALUE: &str = "doc.containsKey(params.f) && doc[params.f].size() > 0 ? 1 : 0";
+
+    #[test]
+    fn the_has_value_script_is_the_only_max_script() {
+        let has = serde_json::json!({ "max": { "script": { "source": HAS_VALUE, "params": { "f": "network.bytes" } } } });
+        let specs = compile_aggs(&serde_json::json!({ "m_has": has })).unwrap();
+        assert!(matches!(&specs[0].kind, AggKind::HasValue { field } if field == "network.bytes"));
+        let other = serde_json::json!({ "m": { "max": { "script": { "source": "doc['x'].value * 2" } } } });
+        assert!(compile_aggs(&other).is_err());
+    }
+
+    #[test]
+    fn has_value_first_ranks_buckets_with_no_values_last() {
+        let dir = std::env::temp_dir().join(format!("arkimedb-aggs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = arkimedb_core::config::Config { data_dir: dir.clone(), ..Default::default() };
+        let engine = arkimedb_storage::Engine::open(config).unwrap();
+        let docs = [serde_json::json!({ "port": 1, "bytes": 100 }), serde_json::json!({ "port": 2, "bytes": 50 }), serde_json::json!({ "port": 3 })];
+        let ops = docs.iter().enumerate().map(|(i, d)| arkimedb_storage::BulkOp {
+            collection: None,
+            kind: arkimedb_storage::BulkKind::Index { id: Some(i.to_string()), source: d.clone(), force_version: None },
+        }).collect();
+        engine.bulk_write(Some("t"), ops).unwrap();
+        engine.refresh(Some("t")).unwrap();
+        let cols = engine.resolve("t").unwrap();
+        let has = serde_json::json!({ "max": { "script": { "source": HAS_VALUE, "params": { "f": "bytes" } } } });
+
+        // port 3 has no bytes, so its avg/min/max is null; it ranks last whichever way
+        for bucket in ["terms", "histogram"] {
+            for (op, order_dir, want) in [("avg", "desc", [1, 2, 3]), ("avg", "asc", [2, 1, 3]), ("max", "asc", [2, 1, 3]), ("min", "desc", [1, 2, 3])] {
+                let mut b = serde_json::json!({ "field": "port", "order": [{ "m_has": "desc" }, { "m": order_dir }] });
+                if bucket == "histogram" { b["interval"] = serde_json::json!(1); }
+                let mut sub = serde_json::Map::new();
+                sub.insert(op.into(), serde_json::json!({ "field": "bytes" }));
+                let mut agg = serde_json::Map::new();
+                agg.insert(bucket.into(), b);
+                agg.insert("aggs".into(), serde_json::json!({ "m": sub, "m_has": has }));
+                let specs = compile_aggs(&serde_json::json!({ "a": agg })).unwrap();
+                let out = run_aggs(&cols, &serde_json::json!({ "match_all": {} }), &specs).unwrap().into_json_map();
+                let buckets = out["a"]["buckets"].as_array().unwrap();
+                let keys: Vec<i64> = buckets.iter().map(|x| x["key"].as_f64().unwrap() as i64).collect();
+                assert_eq!(keys, want, "{bucket} {op} {order_dir}");
+                let has_values: Vec<f64> = buckets.iter().map(|x| x["m_has"]["value"].as_f64().unwrap()).collect();
+                assert_eq!(has_values, [1.0, 1.0, 0.0], "{bucket} {op} {order_dir}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
