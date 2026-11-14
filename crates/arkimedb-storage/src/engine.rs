@@ -82,6 +82,9 @@ pub struct Collection {
     /// sort_cache; cleared on any write. Enables cross-collection early-stop
     /// when processing cols in extremum order for single-key sorts.
     pub sort_range: RwLock<ahash::AHashMap<String, (arkimedb_core::Scalar, arkimedb_core::Scalar)>>,
+    /// Bumped on every postings change, so a sort scan that raced a write
+    /// isn't cached.
+    pub(crate) sort_gen: std::sync::atomic::AtomicU64,
     pub(crate) storage_cfg: StorageConfig,
     /// True if this collection's Database is shared with other
     /// collections (sessions-family). Writes to shared-DB collections
@@ -116,6 +119,29 @@ pub struct PendingEntry {
 pub const PENDING_MAX: usize = 50_000;
 
 impl Collection {
+    /// Drops the cached sort values. Call after the postings change.
+    pub fn clear_sort_cache(&self) {
+        let mut cache = self.sort_cache.write();
+        self.sort_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        cache.clear();
+        self.sort_range.write().clear();
+    }
+
+    pub fn sort_gen(&self) -> u64 {
+        self.sort_gen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Caches sort values scanned when `sort_gen()` was `gen`, unless a
+    /// write changed the postings since and the scan may be missing rows.
+    pub fn cache_sort(&self, field: &str, gen: u64,
+                      map: Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>,
+                      range: Option<(arkimedb_core::Scalar, arkimedb_core::Scalar)>) {
+        let mut cache = self.sort_cache.write();
+        if self.sort_gen() != gen { return; }
+        cache.insert(field.to_string(), map);
+        if let Some(r) = range { self.sort_range.write().insert(field.to_string(), r); }
+    }
+
     pub fn row_count(&self) -> Result<u64> {
         let r = self.db.begin_read()?;
         let t = r.open_table(self.tables.meta)?;
@@ -829,6 +855,7 @@ fn open_collection(
         reindex_lock: RwLock::new(()),
         sort_cache: RwLock::new(ahash::AHashMap::new()),
         sort_range: RwLock::new(ahash::AHashMap::new()),
+        sort_gen: std::sync::atomic::AtomicU64::new(0),
         storage_cfg,
         shared_db: shared,
         tables,
@@ -1053,17 +1080,14 @@ fn bulk_write_one_db(
     // has been updated. Order by collection-Arc pointer to get a deterministic
     // lock order across threads, avoiding any deadlock if two bulks touch the
     // same collections.
+    let mut uniq: Vec<Arc<Collection>> = Vec::with_capacity(cols.len());
+    let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::new();
+    for (c, _, _) in cols {
+        if seen.insert(Arc::as_ptr(c) as usize) { uniq.push(c.clone()); }
+    }
+    uniq.sort_by_key(|c| Arc::as_ptr(c) as usize);
     let mut reindex_guards: Vec<parking_lot::RwLockWriteGuard<()>> = {
-        let mut uniq: Vec<Arc<Collection>> = Vec::with_capacity(cols.len());
-        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::new();
-        for (c, _, _) in cols {
-            if seen.insert(Arc::as_ptr(c) as usize) { uniq.push(c.clone()); }
-        }
-        uniq.sort_by_key(|c| Arc::as_ptr(c) as usize);
-        // Any bulk that touches a collection invalidates its sort_cache;
-        // keep it simple and clear under the write lock we already hold.
-        for c in &uniq { c.sort_cache.write().clear(); c.sort_range.write().clear(); }
-        uniq.into_iter().map(|c| {
+        uniq.iter().map(|c| {
             // SAFETY: the guard's lifetime is tied to the Collection which we
             // keep alive via the clones in `cols`. We leak the Arc into the
             // guard's lifetime by using a raw borrow — acceptable because the
@@ -1258,6 +1282,7 @@ fn bulk_write_one_db(
     // Drop reindex guards explicitly *after* all post-commit index work is
     // done so readers cannot see the committed-on-disk-but-stale-in-memory
     // state.
+    for c in &uniq { c.clear_sort_cache(); }
     drop(reindex_guards);
     out
 }
@@ -1306,8 +1331,7 @@ pub(crate) fn drain_pending_reindex(col: &Arc<Collection>, fc: &Arc<FieldCatalog
         index_one(&col.index, &mut schema, row_id, &source);
     }
     *col.last_refresh.lock() = std::time::Instant::now();
-    col.sort_cache.write().clear();
-    col.sort_range.write().clear();
+    col.clear_sort_cache();
 }
 
 // Tiny non-crypto id. Per-thread xorshift seeded once; avoids reseeding from

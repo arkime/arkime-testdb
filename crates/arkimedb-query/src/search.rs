@@ -327,6 +327,15 @@ pub fn build_sort_cache(col: &Arc<Collection>, field: &str)
             return (m.clone(), lo.clone(), hi.clone());
         }
     }
+    let gen = col.sort_gen();
+    let (arc, lo, hi) = scan_sort_values(col, field);
+    col.cache_sort(field, gen, arc.clone(), Some((lo.clone(), hi.clone())));
+    (arc, lo, hi)
+}
+
+fn scan_sort_values(col: &Arc<Collection>, field: &str)
+    -> (Arc<ahash::AHashMap<u32, arkimedb_core::Scalar>>, arkimedb_core::Scalar, arkimedb_core::Scalar)
+{
     let mut m: ahash::AHashMap<u32, arkimedb_core::Scalar> = ahash::AHashMap::new();
     let mut lo: Option<arkimedb_core::Scalar> = None;
     let mut hi: Option<arkimedb_core::Scalar> = None;
@@ -338,10 +347,7 @@ pub fn build_sort_cache(col: &Arc<Collection>, field: &str)
     });
     let lo = lo.unwrap_or(arkimedb_core::Scalar::Null);
     let hi = hi.unwrap_or(arkimedb_core::Scalar::Null);
-    let arc = Arc::new(m);
-    col.sort_cache.write().insert(field.to_string(), arc.clone());
-    col.sort_range.write().insert(field.to_string(), (lo.clone(), hi.clone()));
-    (arc, lo, hi)
+    (Arc::new(m), lo, hi)
 }
 
 fn hydrate_and_respond(
@@ -763,17 +769,7 @@ fn sort_hits(hits: &mut Vec<(Arc<Collection>, u32)>, sort: &[SortSpec]) -> Resul
     for (ci, col) in by_col.iter().enumerate() {
         for (si, s) in sort.iter().enumerate() {
             if col.index.field_type(&s.field).is_none() { continue; }
-            if let Some(m) = col.sort_cache.read().get(&s.field) {
-                col_field_vals[ci][si] = Some(m.clone());
-                continue;
-            }
-            let mut m = ahash::AHashMap::new();
-            col.index.for_each_value(&s.field, |sc, bm| {
-                for r in bm.iter() { m.entry(r).or_insert_with(|| sc.clone()); }
-            });
-            let arc = Arc::new(m);
-            col.sort_cache.write().insert(s.field.clone(), arc.clone());
-            col_field_vals[ci][si] = Some(arc);
+            col_field_vals[ci][si] = Some(build_sort_cache(col, &s.field).0);
         }
     }
     let col_field_indexed: Vec<Vec<bool>> = col_field_vals.iter()
@@ -888,4 +884,47 @@ fn cmp_jv(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn index(engine: &arkimedb_storage::Engine, id: &str, ts: i64) {
+        let op = arkimedb_storage::BulkOp {
+            collection: None,
+            kind: arkimedb_storage::BulkKind::Index { id: Some(id.into()), source: serde_json::json!({ "ts": ts }), force_version: None },
+        };
+        engine.bulk_write(Some("t"), vec![op]).unwrap();
+    }
+
+    fn newest(cols: &[Arc<Collection>]) -> String {
+        let req: SearchRequest = serde_json::from_value(serde_json::json!({ "sort": [{ "ts": { "order": "desc" } }] })).unwrap();
+        execute(cols, &req).unwrap().hits.hits[0]._id.clone()
+    }
+
+    #[test]
+    fn a_sort_scan_that_raced_a_write_is_not_cached() {
+        let dir = std::env::temp_dir().join(format!("arkimedb-sort-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = arkimedb_core::config::Config { data_dir: dir.clone(), ..Default::default() };
+        let engine = arkimedb_storage::Engine::open(config).unwrap();
+        index(&engine, "a", 1);
+        engine.refresh(Some("t")).unwrap();
+        let cols = engine.resolve("t").unwrap();
+        let col = &cols[0];
+        assert_eq!(newest(&cols), "a");
+
+        // A search scans the sort values, a write lands, then the search caches
+        // what it scanned. First with the write deferred to a refresh, then applied
+        // by the bulk itself
+        for (id, ts, deferred) in [("b", 2, true), ("c", 3, false)] {
+            if !deferred { col.refresh_interval_ms.store(0, std::sync::atomic::Ordering::Relaxed); }
+            let gen = col.sort_gen();
+            let (stale, lo, hi) = scan_sort_values(col, "ts");
+            index(&engine, id, ts);
+            if deferred { engine.refresh(Some("t")).unwrap(); }
+            col.cache_sort("ts", gen, stale, Some((lo, hi)));
+            assert_eq!(newest(&cols), id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
