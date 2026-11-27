@@ -28,10 +28,13 @@ pub enum AggKind {
     // ordered on first so buckets with no values for a metric rank last
     HasValue { field: String },
     // order: (key, ascending) pairs compared in turn, where a key is "_count",
-    // "_key", or a metric sub-agg name; empty = ES default (_count desc)
-    Terms { field: String, size: usize, min_doc_count: u64, order: Vec<(String, bool)> },
-    TermsIpPort { ip_field: String, port_field: String, size: usize, sep: String },
-    TermsAllIp { size: usize },
+    // "_key", or a metric sub-agg name; empty = ES default (_count desc).
+    // include/exclude: ES's array form, the exact terms to keep or drop
+    Terms { field: String, size: usize, min_doc_count: u64, order: Vec<(String, bool)>,
+            include: Option<AHashSet<String>>, exclude: Option<AHashSet<String>> },
+    // Arkime's ip:port and source/destination ip scripts, ordered as for Terms
+    TermsIpPort { ip_field: String, port_field: String, size: usize, sep: String, order: Vec<(String, bool)> },
+    TermsAllIp { size: usize, order: Vec<(String, bool)> },
     // order as for Terms (empty = ES default, _key asc); min_doc_count below
     // 1 is treated as 1, empty buckets are never emitted
     // offset: the buckets start that far past the interval's multiples (ES histogram offset)
@@ -184,24 +187,25 @@ fn compile_one(name: &str, spec: &J) -> Result<AggRequest> {
                     // Dual-IP: summary "allIp" script returns [source.ip, destination.ip]
                     if src.contains("source.ip") && src.contains("destination.ip")
                         && !src.contains("port") {
-                        kind = Some(AggKind::TermsAllIp { size });
+                        kind = Some(AggKind::TermsAllIp { size, order: parse_order(v) });
                         continue;
                     }
                     // IP + port composite. Detect separator: '_' vs ':' (default ':'; IPv6 falls back to '.').
                     let sep = if src.contains("'_'") || src.contains("\"_\"") { "_".to_string() } else { ":".to_string() };
                     if src.contains("destination.ip") && src.contains("destination.port") {
-                        kind = Some(AggKind::TermsIpPort { ip_field: "destination.ip".into(), port_field: "destination.port".into(), size, sep });
+                        kind = Some(AggKind::TermsIpPort { ip_field: "destination.ip".into(), port_field: "destination.port".into(), size, sep, order: parse_order(v) });
                         continue;
                     }
                     if src.contains("source.ip") && src.contains("source.port") {
-                        kind = Some(AggKind::TermsIpPort { ip_field: "source.ip".into(), port_field: "source.port".into(), size, sep });
+                        kind = Some(AggKind::TermsIpPort { ip_field: "source.ip".into(), port_field: "source.port".into(), size, sep, order: parse_order(v) });
                         continue;
                     }
                 }
                 let f = field_of(v)?;
                 let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(10) as usize;
                 let mdc  = v.get("min_doc_count").and_then(|x| x.as_u64()).unwrap_or(1);
-                AggKind::Terms { field: f, size, min_doc_count: mdc, order: parse_order(v) }
+                AggKind::Terms { field: f, size, min_doc_count: mdc, order: parse_order(v),
+                                 include: parse_term_set(v, "include")?, exclude: parse_term_set(v, "exclude")? }
             }
             "histogram" => {
                 let f = field_of(v)?;
@@ -232,6 +236,20 @@ fn has_value_field(v: &J) -> Option<String> {
     let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
     if compact != "doc.containsKey(params.f)&&doc[params.f].size()>0?1:0" { return None; }
     script.get("params")?.get("f")?.as_str().map(String::from)
+}
+/// A terms agg's include or exclude in ES's array form (exact terms, compared
+/// as the bucket key's string); the regex and partition forms are refused
+/// rather than ignored, which would count terms the client left out.
+fn parse_term_set(v: &J, name: &str) -> Result<Option<AHashSet<String>>> {
+    match v.get(name) {
+        None | Some(J::Null) => Ok(None),
+        Some(J::Array(a)) => Ok(Some(a.iter().map(term_string).collect())),
+        Some(_) => Err(Error::BadRequest(format!("terms {name} is only supported as an array of terms"))),
+    }
+}
+/// A term as a string to compare with include/exclude: a JSON string's own text, else the JSON.
+fn term_string(v: &J) -> String {
+    match v { J::String(s) => s.clone(), other => other.to_string() }
 }
 /// A bucket agg's `order`: (key, ascending) pairs where a key is "_count",
 /// "_key" or a sub-agg name, from one object or ES's array of them; empty when absent.
@@ -373,6 +391,85 @@ pub fn run_aggs(cols: &[Arc<Collection>], query_json: &J, specs: &[AggRequest]) 
     Ok(AggResult::Multi(out))
 }
 
+type PerCol = Vec<(Arc<Collection>, roaring::RoaringBitmap)>;
+/// A terms bucket before ranking: its key, doc count, rows per collection,
+/// and the encoded key that breaks ties (ES's key ascending).
+type TermsCandidate = (Scalar, u64, PerCol, Vec<u8>);
+
+/// Adds one collection's rows for a term to the candidates, keyed by `k`.
+fn add_candidate(merged: &mut Vec<TermsCandidate>, keyed: &mut AHashMap<Vec<u8>, usize>, k: Vec<u8>,
+                 s: &Scalar, col: &Arc<Collection>, hits: roaring::RoaringBitmap) {
+    let n = hits.len();
+    match keyed.get(&k).copied() {
+        Some(i) => {
+            merged[i].1 += n;
+            merged[i].2.push((col.clone(), hits));
+        }
+        None => {
+            keyed.insert(k.clone(), merged.len());
+            merged.push((s.clone(), n, vec![(col.clone(), hits)], k));
+        }
+    }
+}
+
+/// A candidate's rows as one bitmap per collection, the row sets its sub-aggs run over.
+fn subs_sets_of(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], per_col: &PerCol) -> PerCol {
+    sets.iter().map(|(c, _)| {
+        let mut acc = roaring::RoaringBitmap::new();
+        for (cc, bb) in per_col { if Arc::ptr_eq(cc, c) { acc |= bb; } }
+        (c.clone(), acc)
+    }).collect()
+}
+
+/// Ranks terms candidates BEFORE truncating to size, then makes the first
+/// `size` of them buckets with their sub-aggs. ES's default is count desc;
+/// each `order` key may name _count, _key, or a metric sub-agg (computed for
+/// every candidate), and the encoded key ascending breaks ties.
+fn terms_result(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest, mut merged: Vec<TermsCandidate>,
+                size: usize, min_doc_count: u64, order: &[(String, bool)]) -> Result<AggResult> {
+    if order.is_empty() {
+        merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
+    } else {
+        let mut cols = Vec::with_capacity(order.len());
+        for (order_key, asc) in order {
+            let col = match order_key.as_str() {
+                "_count" => OrderCol::Count,
+                "_key" => OrderCol::Key,
+                _ => {
+                    let (sub_name, which) = split_order_key(order_key);
+                    let Some(sub) = spec.subs.iter().find(|s| s.name == sub_name) else {
+                        return Err(Error::BadRequest(format!("terms order references unknown agg: {sub_name}")));
+                    };
+                    let mut vals: Vec<f64> = Vec::with_capacity(merged.len());
+                    for (_, _, per_col, _) in &merged {
+                        let Some(v) = metric_order_value(&run_one(&subs_sets_of(sets, per_col), sub)?, which) else {
+                            return Err(Error::BadRequest(format!("terms order agg is not a metric: {sub_name}")));
+                        };
+                        vals.push(v);
+                    }
+                    OrderCol::Metric(vals)
+                }
+            };
+            cols.push((col, *asc));
+        }
+        let idx = order_index(merged.len(), &cols, |i| merged[i].1, |a, b| merged[a].3.cmp(&merged[b].3));
+        let mut taken: Vec<Option<_>> = merged.into_iter().map(Some).collect();
+        merged = idx.into_iter().map(|i| taken[i].take().unwrap()).collect();
+    }
+    let total: u64 = merged.iter().map(|m| m.1).sum();
+    let mut kept: u64 = 0;
+    let mut buckets = Vec::new();
+    for (s, n, per_col, _) in merged.into_iter().take(size) {
+        if n < min_doc_count { continue; }
+        let subs_sets = subs_sets_of(sets, &per_col);
+        let mut sub_out = AHashMap::new();
+        for sub in &spec.subs { sub_out.insert(sub.name.clone(), run_one(&subs_sets, sub)?); }
+        kept += n;
+        buckets.push(Bucket { key: scalar_to_json(&s), key_as_string: None, doc_count: n, subs: sub_out });
+    }
+    Ok(AggResult::TermsBuckets { buckets, sum_other_doc_count: total.saturating_sub(kept) })
+}
+
 fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest) -> Result<AggResult> {
     match &spec.kind {
         AggKind::Count => {
@@ -450,91 +547,29 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
             }
             Ok(AggResult::Percentiles(percents.iter().map(|p| (*p, weighted_percentile(&mut counts, *p))).collect()))
         }
-        AggKind::Terms { field, size, min_doc_count, order } => {
+        AggKind::Terms { field, size, min_doc_count, order, include, exclude } => {
             // Merge term counts across all collections. Keep per-collection
             // bitmaps separate so sub-aggs see the right row set and so that
             // row-ID collisions across collections don't collapse counts.
-            let mut merged: Vec<(Scalar, u64, Vec<(Arc<Collection>, roaring::RoaringBitmap)>, Vec<u8>)> = Vec::new();
+            let mut merged: Vec<TermsCandidate> = Vec::new();
             let mut keyed: AHashMap<Vec<u8>, usize> = AHashMap::new();
             for (col, bm) in sets {
                 col.index.for_each_value(field, |s, vb| {
                     let hits = vb & bm;
                     if hits.is_empty() { return; }
-                    let n = hits.len();
-                    let k = arkimedb_storage::codec::encode_key(field, s);
-                    match keyed.get(&k).copied() {
-                        Some(i) => {
-                            merged[i].1 += n;
-                            merged[i].2.push((col.clone(), hits));
-                        }
-                        None => {
-                            keyed.insert(k.clone(), merged.len());
-                            merged.push((s.clone(), n, vec![(col.clone(), hits)], k));
-                        }
+                    if include.is_some() || exclude.is_some() {
+                        let t = term_string(&scalar_to_json(s));
+                        if include.as_ref().is_some_and(|i| !i.contains(&t)) { return; }
+                        if exclude.as_ref().is_some_and(|e| e.contains(&t)) { return; }
                     }
+                    add_candidate(&mut merged, &mut keyed, arkimedb_storage::codec::encode_key(field, s), s, col, hits);
                 });
             }
-            let subs_sets_of = |per_col: &Vec<(Arc<Collection>, roaring::RoaringBitmap)>| -> Vec<(Arc<Collection>, roaring::RoaringBitmap)> {
-                sets.iter().map(|(c, _)| {
-                    let mut acc = roaring::RoaringBitmap::new();
-                    for (cc, bb) in per_col { if Arc::ptr_eq(cc, c) { acc |= bb; } }
-                    (c.clone(), acc)
-                }).collect()
-            };
-            // Rank candidates BEFORE truncating to size. ES default is count
-            // desc with encoded-key asc tiebreak; each `order` key may name
-            // _count, _key, or a metric sub-agg (computed for every candidate).
-            if order.is_empty() {
-                merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
-            } else {
-                let mut cols = Vec::with_capacity(order.len());
-                for (order_key, asc) in order {
-                    let col = match order_key.as_str() {
-                        "_count" => OrderCol::Count,
-                        "_key" => OrderCol::Key,
-                        _ => {
-                            let (sub_name, which) = split_order_key(order_key);
-                            let Some(sub) = spec.subs.iter().find(|s| s.name == sub_name) else {
-                                return Err(Error::BadRequest(format!("terms order references unknown agg: {sub_name}")));
-                            };
-                            let mut vals: Vec<f64> = Vec::with_capacity(merged.len());
-                            for (_, _, per_col, _) in &merged {
-                                let Some(v) = metric_order_value(&run_one(&subs_sets_of(per_col), sub)?, which) else {
-                                    return Err(Error::BadRequest(format!("terms order agg is not a metric: {sub_name}")));
-                                };
-                                vals.push(v);
-                            }
-                            OrderCol::Metric(vals)
-                        }
-                    };
-                    cols.push((col, *asc));
-                }
-                let idx = order_index(merged.len(), &cols, |i| merged[i].1, |a, b| merged[a].3.cmp(&merged[b].3));
-                let mut taken: Vec<Option<_>> = merged.into_iter().map(Some).collect();
-                merged = idx.into_iter().map(|i| taken[i].take().unwrap()).collect();
-            }
-            let total: u64 = merged.iter().map(|m| m.1).sum();
-            let mut kept: u64 = 0;
-            let mut buckets = Vec::new();
-            for (s, n, per_col, _) in merged.into_iter().take(*size) {
-                if n < *min_doc_count { continue; }
-                let subs_sets = subs_sets_of(&per_col);
-                let mut sub_out = AHashMap::new();
-                for sub in &spec.subs { sub_out.insert(sub.name.clone(), run_one(&subs_sets, sub)?); }
-                kept += n;
-                buckets.push(Bucket {
-                    key: scalar_to_json(&s),
-                    key_as_string: None,
-                    doc_count: n,
-                    subs: sub_out,
-                });
-            }
-            Ok(AggResult::TermsBuckets { buckets, sum_other_doc_count: total.saturating_sub(kept) })
+            terms_result(sets, spec, merged, *size, *min_doc_count, order)
         }
-        AggKind::TermsIpPort { ip_field, port_field, size, sep: sep_arg } => {
-            use std::collections::BTreeMap;
-            // key -> (display_scalar, total_count, Vec<(col, bitmap)>)
-            let mut merged: BTreeMap<String, (Scalar, u64, Vec<(Arc<Collection>, roaring::RoaringBitmap)>)> = BTreeMap::new();
+        AggKind::TermsIpPort { ip_field, port_field, size, sep: sep_arg, order } => {
+            let mut merged: Vec<TermsCandidate> = Vec::new();
+            let mut keyed: AHashMap<Vec<u8>, usize> = AHashMap::new();
             for (col, bm) in sets {
                 // Build per-port row bitmap map
                 let mut port_map: Vec<(Scalar, roaring::RoaringBitmap)> = Vec::new();
@@ -562,73 +597,32 @@ fn run_one(sets: &[(Arc<Collection>, roaring::RoaringBitmap)], spec: &AggRequest
                         };
                         let sep = if sep_arg == "_" { "_" } else if ip_str.contains('.') && !ip_str.contains(':') { ":" } else { "." };
                         let key = format!("{}{}{}", ip_str, sep, port_str);
-                        let n = both.len();
-                        let entry = merged.entry(key.clone()).or_insert_with(|| (Scalar::Str(key.clone().into()), 0, Vec::new()));
-                        entry.1 += n;
-                        entry.2.push((col.clone(), both));
+                        // a script's string keys tie-break in byte order
+                        add_candidate(&mut merged, &mut keyed, key.as_bytes().to_vec(), &Scalar::Str(key), col, both);
                     }
                 });
             }
-            let mut items: Vec<(Scalar, u64, Vec<(Arc<Collection>, roaring::RoaringBitmap)>)> =
-                merged.into_iter().map(|(_k, v)| v).collect();
-            items.sort_by(|a, b| b.1.cmp(&a.1));
-            let total: u64 = items.iter().map(|m| m.1).sum();
-            let mut kept: u64 = 0;
-            let mut buckets = Vec::new();
-            for (s, count, per_col) in items.into_iter().take(*size) {
-                let subs_sets: Vec<(Arc<Collection>, roaring::RoaringBitmap)> = sets.iter().map(|(c, _)| {
-                    let mut acc = roaring::RoaringBitmap::new();
-                    for (cc, bb) in &per_col { if Arc::ptr_eq(cc, c) { acc |= bb; } }
-                    (c.clone(), acc)
-                }).collect();
-                let mut sub_out = AHashMap::new();
-                for sub in &spec.subs { sub_out.insert(sub.name.clone(), run_one(&subs_sets, sub)?); }
-                kept += count;
-                buckets.push(Bucket { key: scalar_to_json(&s), key_as_string: None, doc_count: count, subs: sub_out });
-            }
-            Ok(AggResult::TermsBuckets { buckets, sum_other_doc_count: total.saturating_sub(kept) })
+            terms_result(sets, spec, merged, *size, 1, order)
         }
-        AggKind::TermsAllIp { size } => {
+        AggKind::TermsAllIp { size, order } => {
             // Union of source.ip and destination.ip values — a doc contributes
             // to both its source and destination IP buckets.
-            let mut merged: Vec<(Scalar, u64, Vec<(Arc<Collection>, roaring::RoaringBitmap)>, Vec<u8>)> = Vec::new();
+            let mut merged: Vec<TermsCandidate> = Vec::new();
             let mut keyed: AHashMap<Vec<u8>, usize> = AHashMap::new();
             for (col, bm) in sets {
                 for field in &["source.ip", "destination.ip"] {
                     col.index.for_each_value(field, |s, vb| {
                         let hits = vb & bm;
                         if hits.is_empty() { return; }
-                        let n = hits.len();
-                        let k = arkimedb_storage::codec::encode_key("ip", s);
-                        match keyed.get(&k).copied() {
-                            Some(i) => {
-                                merged[i].1 += n;
-                                merged[i].2.push((col.clone(), hits));
-                            }
-                            None => {
-                                keyed.insert(k.clone(), merged.len());
-                                merged.push((s.clone(), n, vec![(col.clone(), hits)], k));
-                            }
-                        }
+                        add_candidate(&mut merged, &mut keyed, arkimedb_storage::codec::encode_key("ip", s), s, col, hits);
                     });
                 }
             }
-            merged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
-            let total: u64 = merged.iter().map(|m| m.1).sum();
-            let mut kept: u64 = 0;
-            let mut buckets = Vec::new();
-            for (s, n, per_col, _) in merged.into_iter().take(*size) {
-                let subs_sets: Vec<(Arc<Collection>, roaring::RoaringBitmap)> = sets.iter().map(|(c, _)| {
-                    let mut acc = roaring::RoaringBitmap::new();
-                    for (cc, bb) in &per_col { if Arc::ptr_eq(cc, c) { acc |= bb; } }
-                    (c.clone(), acc)
-                }).collect();
-                let mut sub_out = AHashMap::new();
-                for sub in &spec.subs { sub_out.insert(sub.name.clone(), run_one(&subs_sets, sub)?); }
-                kept += n;
-                buckets.push(Bucket { key: scalar_to_json(&s), key_as_string: None, doc_count: n, subs: sub_out });
+            // a doc from an IP to itself has it on both sides, which ES counts once
+            for c in &mut merged {
+                c.1 = subs_sets_of(sets, &c.2).iter().map(|(_, b)| b.len()).sum();
             }
-            Ok(AggResult::TermsBuckets { buckets, sum_other_doc_count: total.saturating_sub(kept) })
+            terms_result(sets, spec, merged, *size, 1, order)
         }
         AggKind::Histogram { field, interval, offset, min_doc_count, order } => {
             // Fast path: if all sub-aggs are metric (sum/min/max/avg/value_count)
@@ -1065,6 +1059,80 @@ mod tests {
                 assert_eq!(has_values, [1.0, 1.0, 0.0], "{bucket} {op} {order_dir}");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // a small "t" collection of the given docs, for running aggs on
+    fn test_cols(name: &str, docs: &[J]) -> (std::path::PathBuf, Vec<Arc<Collection>>) {
+        let dir = std::env::temp_dir().join(format!("arkimedb-aggs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = arkimedb_core::config::Config { data_dir: dir.clone(), ..Default::default() };
+        let engine = arkimedb_storage::Engine::open(config).unwrap();
+        let ops = docs.iter().enumerate().map(|(i, d)| arkimedb_storage::BulkOp {
+            collection: None,
+            kind: arkimedb_storage::BulkKind::Index { id: Some(i.to_string()), source: d.clone(), force_version: None },
+        }).collect();
+        engine.bulk_write(Some("t"), ops).unwrap();
+        engine.refresh(Some("t")).unwrap();
+        (dir, engine.resolve("t").unwrap())
+    }
+
+    fn bucket_keys(cols: &[Arc<Collection>], agg: J) -> Vec<(String, u64)> {
+        let specs = compile_aggs(&serde_json::json!({ "a": agg })).unwrap();
+        let out = run_aggs(cols, &serde_json::json!({ "match_all": {} }), &specs).unwrap().into_json_map();
+        out["a"]["buckets"].as_array().unwrap().iter()
+            .map(|b| (term_string(&b["key"]), b["doc_count"].as_u64().unwrap())).collect()
+    }
+
+    fn sessions() -> Vec<J> {
+        let s = |src: &str, dst: &str, port: u64, bytes: u64| serde_json::json!({
+            "source": { "ip": src }, "destination": { "ip": dst, "port": port }, "network": { "bytes": bytes } });
+        vec![s("10.0.0.1", "10.0.0.2", 80, 10), s("10.0.0.1", "10.0.0.2", 80, 10), s("10.0.0.3", "10.0.0.2", 80, 10),
+             s("10.0.0.3", "10.0.0.4", 53, 500), s("10.0.0.4", "10.0.0.4", 53, 1)]
+    }
+
+    #[test]
+    fn script_terms_follow_the_order() {
+        let (dir, cols) = test_cols("script-order", &sessions());
+        let ip_port = "if (doc['destination.port'].size() == 0) { return []; } return [doc['destination.ip'].value + '_' + doc['destination.port'].value];";
+        let all_ip = "if (doc['source.ip'].size() == 0) { return []; } return [doc['source.ip'].value, doc['destination.ip'].value];";
+        let agg = |src: &str, order: J, size: u64| serde_json::json!({
+            "terms": { "script": { "source": src, "lang": "painless" }, "size": size, "order": order },
+            "aggs": { "m0": { "sum": { "field": "network.bytes" } } } });
+        let kv = |v: &[(&str, u64)]| v.iter().map(|(k, n)| (k.to_string(), *n)).collect::<Vec<_>>();
+        // by count (the default), by the bytes sum, and by key
+        assert_eq!(bucket_keys(&cols, agg(ip_port, serde_json::json!({ "_count": "desc" }), 5)), kv(&[("10.0.0.2_80", 3), ("10.0.0.4_53", 2)]));
+        assert_eq!(bucket_keys(&cols, agg(ip_port, serde_json::json!({ "m0": "desc" }), 1)), kv(&[("10.0.0.4_53", 2)]));
+        assert_eq!(bucket_keys(&cols, agg(ip_port, serde_json::json!([{ "m0": "asc" }]), 5)), kv(&[("10.0.0.2_80", 3), ("10.0.0.4_53", 2)]));
+        assert_eq!(bucket_keys(&cols, agg(all_ip, serde_json::json!({ "m0": "desc" }), 2)), kv(&[("10.0.0.3", 2), ("10.0.0.4", 2)]));
+        assert_eq!(bucket_keys(&cols, agg(all_ip, serde_json::json!({ "_key": "asc" }), 2)), kv(&[("10.0.0.1", 2), ("10.0.0.2", 3)]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_ip_counts_a_doc_from_an_ip_to_itself_once() {
+        let (dir, cols) = test_cols("all-ip-self", &sessions());
+        let all_ip = "if (doc['source.ip'].size() == 0) { return []; } return [doc['source.ip'].value, doc['destination.ip'].value];";
+        let got = bucket_keys(&cols, serde_json::json!({ "terms": { "script": { "source": all_ip }, "size": 10 } }));
+        // 10.0.0.4 is in two docs, one of them to itself
+        assert!(got.contains(&("10.0.0.4".to_string(), 2)), "{got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terms_include_and_exclude_keep_only_those_terms() {
+        let (dir, cols) = test_cols("include", &sessions());
+        let terms = |extra: J| {
+            let mut t = serde_json::json!({ "field": "destination.ip", "size": 10 });
+            for (k, v) in extra.as_object().unwrap() { t[k] = v.clone(); }
+            serde_json::json!({ "terms": t })
+        };
+        let kv = |v: &[(&str, u64)]| v.iter().map(|(k, n)| (k.to_string(), *n)).collect::<Vec<_>>();
+        assert_eq!(bucket_keys(&cols, terms(serde_json::json!({ "include": ["10.0.0.4", "10.9.9.9"] }))), kv(&[("10.0.0.4", 2)]));
+        assert_eq!(bucket_keys(&cols, terms(serde_json::json!({ "exclude": ["10.0.0.2"] }))), kv(&[("10.0.0.4", 2)]));
+        assert_eq!(bucket_keys(&cols, serde_json::json!({ "terms": { "field": "destination.port", "include": [53] } })), kv(&[("53", 2)]));
+        // the other include forms are refused, not ignored
+        assert!(compile_aggs(&serde_json::json!({ "a": terms(serde_json::json!({ "include": "10.*" })) })).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
